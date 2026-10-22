@@ -1,0 +1,16 @@
+{
+  "name": "eventrail",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A distributed, persistent event streaming broker with partitioned, replicated logs.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
+  }
+}
