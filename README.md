@@ -7,8 +7,9 @@ and commit their progress. Partitions are replicated across brokers with
 leader-follower replication so that acknowledged records survive the loss of
 a broker.
 
-> **Status:** early development. The storage contract and an in-memory log are
-> implemented and tested; persistence, networking, consumer groups, and
+> **Status:** early development. The storage contract, an in-memory log, and
+> the binary record batch format are implemented and tested; file persistence,
+> networking, consumer groups, and
 > replication are designed but not yet built. EventRail uses its own wire
 > protocol, is not production-ready, and has not been benchmarked. Sections
 > marked *(planned)* describe design targets, not current behavior.
@@ -94,7 +95,7 @@ without a network and the protocol can be tested without sockets.
  broker    request routing, replication,                 (planned)
            consumer groups, cluster metadata
  ───────────────────────────────────────────────────────────────────
- storage   Log contract, MemoryLog                       (implemented)
+ storage   Log contract, MemoryLog, record batch format  (implemented)
            segments, offset index, crash recovery        (planned)
 ```
 
@@ -134,6 +135,26 @@ interface every partition log implementation must satisfy:
 array-backed implementation used as the reference for the contract. It does
 not persist data.
 
+**Record batch format** ([src/storage/record-batch.ts](src/storage/record-batch.ts)),
+the binary layout batches will use on disk. All integers are big-endian.
+
+```
+offset  size  field
+ 0      4     batchLength   total batch size in bytes (length prefix)
+ 4      4     crc32         checksum of bytes 8..end
+ 8      8     baseOffset    offset of the first record
+16      8     timestamp     append time, Unix epoch milliseconds
+24      4     recordCount   number of records that follow
+28      ...   records       keyLength (int32, -1 = null), key,
+                            valueLength (uint32), value
+```
+
+Decoding never throws on bad data. It returns `ok` with the batch and its
+size, `incomplete` when the buffer ends before the batch does (for example, a
+write cut short by a crash), or `corrupt` when the checksum fails or a length
+or count is inconsistent. The checksum covers the base offset as well as the
+records, and every length is bounds-checked even when the checksum passes.
+
 ## Getting started
 
 Requirements: Node.js 22 or later.
@@ -155,9 +176,11 @@ src/
   common/types.ts          record types shared across layers
   storage/log.ts           Log interface and LogError
   storage/memory-log.ts    in-memory Log implementation
+  storage/record-batch.ts  binary record batch encoding and decoding
 test/
   storage/log-contract.ts  contract tests every Log implementation must pass
   storage/memory-log.test.ts
+  storage/record-batch.test.ts
 ```
 
 ## Testing approach
@@ -168,6 +191,9 @@ test/
   suite as `MemoryLog`.
 - **Failure cases are first-class.** Invalid arguments, empty batches, and
   out-of-range reads are tested alongside the normal path.
+- **Exhaustive damage tests.** The record batch decoder is checked against a
+  batch truncated at every possible byte (always `incomplete`) and a batch
+  with each single byte damaged (never accepted).
 - **Planned fault-injection tests** will cover truncated segment files, killed
   leaders, lagging followers, and stale consumer group members.
 
@@ -175,7 +201,8 @@ test/
 
 - [x] Toolchain: strict TypeScript, build, test runner
 - [x] `Log` contract and in-memory log
-- [ ] File-backed log: segments, CRC-checked record batches, offset index
+- [x] Binary record batch format with CRC32 checksums
+- [ ] File-backed log: segments and offset index
 - [ ] Crash recovery: torn-write detection and truncation
 - [ ] Topics and partitions with key-based routing
 - [ ] Wire protocol, TCP server, producer and consumer clients
