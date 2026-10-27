@@ -1,4 +1,4 @@
-import { describe, test } from "node:test";
+import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 import type { RecordInput } from "../../src/common/types.js";
@@ -25,9 +25,23 @@ async function assertLogError(promise: Promise<unknown>, code: LogErrorCode): Pr
  * file calls this with its own factory, so they are all held to the same rules.
  * This file is deliberately not named *.test.ts, so the runner never runs it directly.
  */
-export function runLogContractTests(name: string, createLog: LogFactory): void {
+export function runLogContractTests(name: string, createLogFromFactory: LogFactory): void {
   describe(`${name} satisfies the Log contract`, () => {
     const fixedClock = () => 1_000;
+
+    // Every log a test opens is closed afterwards, even if the test fails, so
+    // file-backed logs never leave open handles behind.
+    const openLogs: Log[] = [];
+    const createLog = async (clock: () => number): Promise<Log> => {
+      const log = await createLogFromFactory(clock);
+      openLogs.push(log);
+      return log;
+    };
+    afterEach(async () => {
+      for (const log of openLogs.splice(0)) {
+        await log.close();
+      }
+    });
 
     describe("append", () => {
       test("a new log is empty", async () => {
@@ -74,6 +88,21 @@ export function runLogContractTests(name: string, createLog: LogFactory): void {
         await assertLogError(log.append([]), "EMPTY_BATCH");
         assert.equal(log.logEndOffset, 1);
       });
+
+      test("concurrent appends are applied in call order with no gaps", async () => {
+        const log = await createLog(fixedClock);
+        // Started together without awaiting each one, so a log that lets
+        // appends interleave would assign duplicate or out-of-order offsets.
+        const results = await Promise.all(
+          [0, 1, 2, 3, 4].map((i) => log.append([record(`${i}a`), record(`${i}b`)])),
+        );
+        assert.deepEqual(
+          results.map((r) => r.baseOffset),
+          [0, 2, 4, 6, 8],
+        );
+        const values = (await log.read(0, 10)).map((r) => r.value.toString());
+        assert.deepEqual(values, ["0a", "0b", "1a", "1b", "2a", "2b", "3a", "3b", "4a", "4b"]);
+      });
     });
 
     describe("read", () => {
@@ -91,6 +120,17 @@ export function runLogContractTests(name: string, createLog: LogFactory): void {
         await log.append([record("a"), record("b"), record("c")]);
         const values = (await log.read(1, 10)).map((r) => r.value.toString());
         assert.deepEqual(values, ["b", "c"]);
+      });
+
+      test("a read can start mid-batch and span several batches", async () => {
+        const log = await createLog(fixedClock);
+        await log.append([record("a"), record("b")]);
+        await log.append([record("c")]);
+        await log.append([record("d"), record("e")]);
+        const offsets = (await log.read(1, 3)).map((r) => r.offset);
+        assert.deepEqual(offsets, [1, 2, 3]);
+        const tail = (await log.read(4, 10)).map((r) => r.value.toString());
+        assert.deepEqual(tail, ["e"]);
       });
 
       test("maxRecords caps how many records are returned", async () => {
@@ -143,6 +183,18 @@ export function runLogContractTests(name: string, createLog: LogFactory): void {
         assert.equal(stored?.key?.toString(), "key");
       });
 
+      test("changing an input buffer before a queued append completes does not change it", async () => {
+        const log = await createLog(fixedClock);
+        const first = log.append([record("first")]);
+        const input = record("abc");
+        // Not awaited, so a log that writes later might still be holding the buffer.
+        const second = log.append([input]);
+        input.value.write("XYZ");
+        await Promise.all([first, second]);
+        const [stored] = await log.read(1, 1);
+        assert.equal(stored?.value.toString(), "abc");
+      });
+
       test("changing a returned buffer does not change the stored record", async () => {
         const log = await createLog(fixedClock);
         await log.append([record("abc")]);
@@ -150,6 +202,22 @@ export function runLogContractTests(name: string, createLog: LogFactory): void {
         first?.value.write("XYZ");
         const [again] = await log.read(0, 1);
         assert.equal(again?.value.toString(), "abc");
+      });
+    });
+
+    describe("close", () => {
+      test("append and read are rejected after close", async () => {
+        const log = await createLog(fixedClock);
+        await log.append([record("a")]);
+        await log.close();
+        await assertLogError(log.append([record("b")]), "LOG_CLOSED");
+        await assertLogError(log.read(0, 1), "LOG_CLOSED");
+      });
+
+      test("closing twice is allowed", async () => {
+        const log = await createLog(fixedClock);
+        await log.close();
+        await log.close();
       });
     });
   });

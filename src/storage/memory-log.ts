@@ -1,5 +1,5 @@
 import type { LogRecord, RecordInput } from "../common/types.js";
-import { LogError, type AppendResult, type Log } from "./log.js";
+import { LogError, validateReadArguments, type AppendResult, type Log } from "./log.js";
 
 export interface MemoryLogOptions {
   /** Returns the current time in milliseconds. Injectable so tests control timestamps. */
@@ -14,6 +14,7 @@ export class MemoryLog implements Log {
   // Invariant: records[i].offset === i, so looking up an offset is an array index.
   private readonly records: LogRecord[] = [];
   private readonly clock: () => number;
+  private closed = false;
 
   constructor(options: MemoryLogOptions = {}) {
     this.clock = options.clock ?? (() => Date.now());
@@ -24,6 +25,7 @@ export class MemoryLog implements Log {
   }
 
   async append(records: readonly RecordInput[]): Promise<AppendResult> {
+    this.ensureOpen();
     if (records.length === 0) {
       throw new LogError("EMPTY_BATCH", "cannot append an empty batch");
     }
@@ -51,23 +53,8 @@ export class MemoryLog implements Log {
   }
 
   async read(offset: number, maxRecords: number): Promise<LogRecord[]> {
-    if (!Number.isSafeInteger(offset) || offset < 0) {
-      throw new LogError("INVALID_OFFSET", `offset must be a non-negative integer, got ${offset}`);
-    }
-    // A limit of 0 would always return [] and look like "caught up" to a consumer.
-    if (!Number.isSafeInteger(maxRecords) || maxRecords < 1) {
-      throw new LogError(
-        "INVALID_MAX_RECORDS",
-        `maxRecords must be a positive integer, got ${maxRecords}`,
-      );
-    }
-    // Reading at the end is the normal caught-up state; past the end is an error.
-    if (offset > this.logEndOffset) {
-      throw new LogError(
-        "OFFSET_OUT_OF_RANGE",
-        `offset ${offset} is past the log end offset ${this.logEndOffset}`,
-      );
-    }
+    this.ensureOpen();
+    validateReadArguments(offset, maxRecords, this.logEndOffset);
 
     // Return copies so callers cannot mutate stored records.
     return this.records.slice(offset, offset + maxRecords).map((record) => ({
@@ -75,6 +62,16 @@ export class MemoryLog implements Log {
       key: copyBuffer(record.key),
       value: Buffer.from(record.value),
     }));
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+
+  private ensureOpen(): void {
+    if (this.closed) {
+      throw new LogError("LOG_CLOSED", "log is closed");
+    }
   }
 }
 
