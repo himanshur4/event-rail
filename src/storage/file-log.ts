@@ -4,8 +4,11 @@
 // Durability: by default every append fsyncs the .log before it resolves, so
 // an acknowledged append survives power loss, not just a process crash.
 //
+// Crash recovery: if a crash left a torn (half-written) batch at the end of the
+// active segment, open() cuts it off and reports it in `recoveredTail`. Damage
+// to acknowledged data is refused instead (rules above loadSegment in segment.ts).
+//
 // Current limits:
-// - A damaged .log file is refused by open(); repairing it is crash recovery (Milestone 3).
 // - New segment files are not made durable at the directory level (fsync of
 //   the directory itself), which some file systems need after creating a file.
 // - Every segment keeps its files open, so very many segments mean many open handles.
@@ -16,14 +19,15 @@ import { mkdir, readdir } from "node:fs/promises";
 import type { LogRecord, RecordInput } from "../common/types.js";
 import { LogError, validateReadArguments, type AppendResult, type Log } from "./log.js";
 import { encodeBatch } from "./record-batch.js";
-import { MAX_UINT32, Segment, parseSegmentFileName } from "./segment.js";
+import { MAX_UINT32, Segment, parseSegmentFileName, type TailTruncation } from "./segment.js";
 
 export interface FileLogOptions {
   /** Returns the current time in milliseconds. Injectable so tests control timestamps. */
   readonly clock?: () => number;
   /**
    * Whether every append waits for fsync (default: true). When false, appended
-   * data survives a crash of this process but may be lost on power failure.
+   * data survives a crash of this process but may be lost on power failure,
+   * and data is fsynced only when a segment is sealed or the log is closed.
    */
   readonly syncOnAppend?: boolean;
   /**
@@ -40,6 +44,12 @@ const DEFAULT_SEGMENT_MAX_BYTES = 16 * 1024 * 1024;
 
 /** A Log stored as a series of append-only segment files in one directory. */
 export class FileLog implements Log {
+  /**
+   * What crash recovery cut off the end of the log when it was opened, or null
+   * if the log ended cleanly. A broker should report a non-null value.
+   */
+  readonly recoveredTail: TailTruncation | null;
+
   private readonly dir: string;
   private readonly clock: () => number;
   private readonly syncOnAppend: boolean;
@@ -48,15 +58,25 @@ export class FileLog implements Log {
   // segment's baseOffset equals the previous segment's nextOffset.
   private readonly segments: Segment[];
   private closed = false;
+  // Set when a write or fsync failed: the files are already closed, and the log
+  // must never fsync again.
+  private failed = false;
   private appendQueue: Promise<void> = Promise.resolve();
 
   // Private: opening needs `await`, so callers use FileLog.open().
-  private constructor(dir: string, segments: Segment[], options: FileLogOptions, segmentMaxBytes: number) {
+  private constructor(
+    dir: string,
+    segments: Segment[],
+    options: FileLogOptions,
+    segmentMaxBytes: number,
+    recoveredTail: TailTruncation | null,
+  ) {
     this.dir = dir;
     this.segments = segments;
     this.clock = options.clock ?? (() => Date.now());
     this.syncOnAppend = options.syncOnAppend ?? true;
     this.segmentMaxBytes = segmentMaxBytes;
+    this.recoveredTail = recoveredTail;
   }
 
   /**
@@ -84,7 +104,7 @@ export class FileLog implements Log {
 
     const segments: Segment[] = [];
     try {
-      for (const baseOffset of baseOffsets) {
+      for (const [i, baseOffset] of baseOffsets.entries()) {
         const previous = segments.at(-1);
         // The log starts at offset 0 (old segments are never deleted yet), and
         // each segment must start exactly where the previous one ended.
@@ -95,9 +115,13 @@ export class FileLog implements Log {
             `segment ${baseOffset} does not follow on from offset ${expected} (missing or extra segment file)`,
           );
         }
-        segments.push(await Segment.open(dir, baseOffset));
+        // Only the last segment may be cut short by recovery: older ones were
+        // flushed before the log moved past them, so damage there is real.
+        const isActive = i === baseOffsets.length - 1;
+        segments.push(await Segment.open(dir, baseOffset, isActive));
       }
-      return new FileLog(dir, segments, options, segmentMaxBytes);
+      const recoveredTail = segments.at(-1)?.truncation ?? null;
+      return new FileLog(dir, segments, options, segmentMaxBytes, recoveredTail);
     } catch (error) {
       await Promise.all(segments.map((s) => s.close()));
       throw error;
@@ -162,7 +186,18 @@ export class FileLog implements Log {
     // finish before closing its files.
     this.closed = true;
     await this.appendQueue;
-    await Promise.all(this.segments.map((s) => s.close()));
+    // After a failed write the files are already closed, and fsyncing again
+    // would be unsafe.
+    if (this.failed) {
+      return;
+    }
+    // Only the active segment can hold unflushed data; older ones were flushed
+    // when they were sealed.
+    try {
+      await this.activeSegment.flush();
+    } finally {
+      await Promise.all(this.segments.map((s) => s.close()));
+    }
   }
 
   private get activeSegment(): Segment {
@@ -186,15 +221,18 @@ export class FileLog implements Log {
       // limit. An empty segment always accepts the batch, so an oversized batch
       // is stored alone instead of rolling forever.
       if (!segment.isEmpty && segment.size + bytes.length > this.segmentMaxBytes) {
-        segment = await Segment.open(this.dir, baseOffset);
+        // Sealed durably first, so a crash can only ever tear the newest segment.
+        await segment.flush();
+        segment = await Segment.open(this.dir, baseOffset, true);
         this.segments.push(segment);
       }
       await segment.append(bytes, baseOffset, records.length, this.syncOnAppend);
     } catch (error) {
       // A failed write or fsync may have left part of a batch on disk, and we
-      // can't know how much, so the log stops accepting work. Reopening deals
-      // with the damaged tail (crash recovery, Milestone 3).
+      // can't know how much, so the log stops accepting work. Reopening cuts
+      // off any partial batch.
       this.closed = true;
+      this.failed = true;
       await Promise.all(this.segments.map((s) => s.close().catch(() => undefined)));
       throw error;
     }

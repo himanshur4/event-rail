@@ -1,23 +1,4 @@
-// A segment is one .log file of record batches plus its .index file. Only the
-// newest (active) segment is written to; older segments are sealed and never
-// change, so old data can later be deleted one whole file at a time.
-//
-// Each file is named after its base offset, padded to 20 digits so that name
-// order equals offset order:
-//
-//   00000000000000000000.log / .index   offsets 0..999     (sealed)
-//   00000000000000001000.log / .index   offsets 1000..     (active)
-//
-// The .index file holds one 8-byte entry per batch:
-//
-//   ┌──────────────────────────┬────────────────────────────────┐
-//   │ relative offset (uint32) │ byte position in .log (uint32) │
-//   └──────────────────────────┴────────────────────────────────┘
-//   relative offset = batch base offset − segment base offset
-//
-// The .log is the source of truth; the index only lets a segment open without
-// decoding its whole .log. It can always be rebuilt from the .log, which is why
-// it is never fsynced.
+﻿// A segment is one .log file of record batches plus its .index file.
 
 import { appendFile, open, readFile, writeFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
@@ -52,6 +33,16 @@ export function parseSegmentFileName(fileName: string): number | null {
   return Number.isSafeInteger(baseOffset) ? baseOffset : null;
 }
 
+/** What crash recovery cut off the end of a segment's .log file when it was opened. */
+export interface TailTruncation {
+  readonly segmentBaseOffset: number;
+  /** The .log file now ends at this byte. */
+  readonly position: number;
+  readonly discardedBytes: number;
+  /** Why the first discarded batch was invalid. */
+  readonly reason: string;
+}
+
 // Where one batch is in the .log file: the index file's contents plus each batch's size.
 interface BatchLocation {
   readonly baseOffset: number; // absolute offset of the batch's first record
@@ -63,20 +54,30 @@ interface SegmentState {
   readonly batches: BatchLocation[];
   readonly size: number;
   readonly nextOffset: number;
+  readonly truncation: TailTruncation | null;
 }
 
-type ScanResult =
-  | { readonly ok: true; readonly batches: BatchLocation[]; readonly nextOffset: number }
-  | { readonly ok: false; readonly reason: string };
+// The valid batches found in some .log bytes and where they end. If the scan
+// stopped early, `invalid` says why and whether a crash mid-append could explain it.
+interface ScanResult {
+  readonly batches: BatchLocation[];
+  readonly nextOffset: number;
+  readonly endPosition: number;
+  readonly invalid: { readonly reason: string; readonly tornWritePossible: boolean } | null;
+}
 
 /** One .log file of record batches and its .index file. */
 export class Segment {
   /** Offset of the first record this segment holds (also its file name). */
   readonly baseOffset: number;
-
+  /** What crash recovery cut off the end of this segment when it was opened, or null. */
+  readonly truncation: TailTruncation | null;
   private readonly logFile: FileHandle;
   private readonly indexFile: FileHandle;
   private readonly batches: BatchLocation[];
+  // Entries for batches written but not yet fsynced (syncOnAppend: false only).
+  // flush() writes them once the .log is durable.
+  private readonly pendingIndexEntries: Buffer[] = [];
   private sizeBytes: number;
   private nextOffsetValue: number;
 
@@ -88,22 +89,25 @@ export class Segment {
     this.batches = state.batches;
     this.sizeBytes = state.size;
     this.nextOffsetValue = state.nextOffset;
+    this.truncation = state.truncation;
   }
 
   /**
    * Opens (or creates) the segment starting at `baseOffset` in `dir`, repairing
-   * its index from the .log file if needed. Rejects with CORRUPT_LOG if the
-   * .log file itself is damaged.
+   * its index from the .log file if needed. With `recoverTail` (only for the
+   * active segment), a torn write at the end of the .log is cut off. Rejects
+   * with CORRUPT_LOG if the .log is damaged in any other way.
    */
-  static async open(dir: string, baseOffset: number): Promise<Segment> {
+  static async open(dir: string, baseOffset: number, recoverTail: boolean): Promise<Segment> {
     const names = segmentFileNames(baseOffset);
+    const logPath = join(dir, names.log);
     const indexPath = join(dir, names.index);
-    const logFile = await open(join(dir, names.log), "a+");
+    const logFile = await open(logPath, "a+");
     let indexFile: FileHandle | undefined;
     try {
-      // The index is loaded and repaired before its handle is opened: on Windows
-      // a file open in append mode can't be truncated, so repairs write by path.
-      const state = await loadSegment(logFile, indexPath, baseOffset);
+      // Repairs write by path before the index handle is opened: on Windows a
+      // file open in append mode can't be truncated.
+      const state = await loadSegment(logFile, logPath, indexPath, baseOffset, recoverTail);
       indexFile = await open(indexPath, "a");
       return new Segment(baseOffset, logFile, indexFile, state);
     } catch (error) {
@@ -134,20 +138,37 @@ export class Segment {
    */
   async append(bytes: Buffer, baseOffset: number, recordCount: number, sync: boolean): Promise<void> {
     const position = this.sizeBytes;
+    const entry = encodeIndexEntry(baseOffset - this.baseOffset, position);
 
     await writeAll(this.logFile, bytes);
+
+    // The index may only list durable batches: crash recovery treats every
+    // listed batch as acknowledged and never cuts it off. So an entry is written
+    // only after its batch is fsynced. The index itself is not fsynced; lost
+    // entries are restored from the .log on open.
     if (sync) {
       await this.logFile.sync();
+      await writeAll(this.indexFile, entry);
+    } else {
+      this.pendingIndexEntries.push(entry);
     }
-
-    // Written after the .log, so a crash in between leaves the index one entry
-    // short, which opening the segment repairs. Not fsynced for the same reason.
-    await writeAll(this.indexFile, encodeIndexEntry(baseOffset - this.baseOffset, position));
 
     // Updated last, so readers never see a batch that isn't fully written.
     this.batches.push({ baseOffset, position, size: bytes.length });
     this.sizeBytes += bytes.length;
     this.nextOffsetValue = baseOffset + recordCount;
+  }
+
+  /**
+   * Makes every appended batch durable, then writes the index entries that were
+   * waiting for that. Does nothing if no entries are waiting.
+   */
+  async flush(): Promise<void> {
+    if (this.pendingIndexEntries.length === 0) {
+      return;
+    }
+    await this.logFile.sync();
+    await writeAll(this.indexFile, Buffer.concat(this.pendingIndexEntries.splice(0)));
   }
 
   /**
@@ -195,7 +216,10 @@ export class Segment {
     return result;
   }
 
-  /** Closes both files. */
+  /**
+   * Closes both files. Does not flush: after a failed write the log must not
+   * fsync again, so FileLog flushes explicitly before a clean close.
+   */
   async close(): Promise<void> {
     await Promise.all([this.logFile.close(), this.indexFile.close()]);
   }
@@ -219,24 +243,28 @@ export class Segment {
   }
 }
 
-// Loading a segment: trust the index, but verify its tail.
+// Crash recovery: a crash during an append can leave a torn write at the end of
+// the .log, either part of a batch or reserved bytes that never received their
+// data. Cutting it off is safe because an append is acknowledged only after its
+// batch is fsynced, so a torn batch was never acknowledged. Damage to
+// acknowledged data must never be cut off, so the tail is cut only if:
+//   1. it is in the active segment (sealed segments are flushed before the log
+//      moves past them, so a crash can't tear them);
+//   2. the bytes are incomplete or corrupt (a crash can't produce a valid batch
+//      with the wrong offset);
+//   3. the index lists nothing at or after the cut (it only lists durable batches).
+// Otherwise opening fails with CORRUPT_LOG and no file is modified.
 //
-//   .index says:  [batch @0] [batch @58] [batch @103]          (3 entries)
-//   .log holds:   [batch @0] [batch @58] [batch @103] [batch @148]
-//                                         ▲
-//                         re-decode from the last indexed batch to the end:
-//                         confirms it is intact, and finds batch @148, which
-//                         the index is missing (crash between the two writes)
-//
-// If the index is malformed, or that re-check fails, it is rebuilt by scanning
-// the whole .log. If even that scan fails, the .log is damaged: CORRUPT_LOG.
-//
-// Trade-off: batches before the last indexed one are not re-checked on open,
-// which would mean reading the whole file. Their checksums are verified on read.
+// Loading trusts the index but verifies its tail. If the index is malformed or
+// that check fails, the whole .log is scanned and the rules above decide what
+// happens to an invalid tail. Batches before the last indexed one are not
+// re-checked on open; their checksums are verified on read.
 async function loadSegment(
   logFile: FileHandle,
+  logPath: string,
   indexPath: string,
   segmentBaseOffset: number,
+  recoverTail: boolean,
 ): Promise<SegmentState> {
   const logSize = (await logFile.stat()).size;
   const indexBytes = await readIndexFile(indexPath);
@@ -246,9 +274,10 @@ async function loadSegment(
     const last = indexed.at(-1);
     const startPosition = last?.position ?? 0;
     const startOffset = last?.baseOffset ?? segmentBaseOffset;
-    const tail = await scanLog(logFile, startPosition, logSize, startOffset);
+    const tailBytes = await readExactly(logFile, startPosition, logSize - startPosition);
+    const tail = scanBatches(tailBytes, startPosition, startOffset);
 
-    if (tail.ok) {
+    if (tail.invalid === null) {
       // Batches are stored back to back, so each size is the gap to the next position.
       const earlier: BatchLocation[] = indexed.slice(0, -1).map((entry, i) => ({
         baseOffset: entry.baseOffset,
@@ -259,18 +288,94 @@ async function loadSegment(
       // from the index. With an empty index, every scanned batch is missing.
       const missing = tail.batches.slice(last === undefined ? 0 : 1);
       if (missing.length > 0) {
+        // After a crash these may exist only in the page cache, so they are
+        // made durable before the index lists them.
+        await logFile.sync();
         await appendFile(indexPath, encodeIndexEntries(missing, segmentBaseOffset));
       }
-      return { batches: [...earlier, ...tail.batches], size: logSize, nextOffset: tail.nextOffset };
+      return {
+        batches: [...earlier, ...tail.batches],
+        size: logSize,
+        nextOffset: tail.nextOffset,
+        truncation: null,
+      };
     }
   }
 
-  const full = await scanLog(logFile, 0, logSize, segmentBaseOffset);
-  if (!full.ok) {
-    throw new LogError("CORRUPT_LOG", `segment ${segmentBaseOffset}: ${full.reason}`);
+  const full = scanBatches(await readExactly(logFile, 0, logSize), 0, segmentBaseOffset);
+  let truncation: TailTruncation | null = null;
+  if (full.invalid !== null) {
+    assertTornWrite(full.invalid, full.endPosition, indexBytes, segmentBaseOffset, recoverTail);
+    await truncateFile(logPath, full.endPosition);
+    truncation = {
+      segmentBaseOffset,
+      position: full.endPosition,
+      discardedBytes: logSize - full.endPosition,
+      reason: full.invalid.reason,
+    };
   }
+
+  // The rebuilt index may only list durable batches.
+  await logFile.sync();
   await writeFile(indexPath, encodeIndexEntries(full.batches, segmentBaseOffset));
-  return { batches: full.batches, size: logSize, nextOffset: full.nextOffset };
+  return {
+    batches: full.batches,
+    size: full.endPosition,
+    nextOffset: full.nextOffset,
+    truncation,
+  };
+}
+
+// Throws CORRUPT_LOG, naming the rule that failed, unless the invalid bytes from
+// `cutPosition` onwards may be cut off as a torn write (rules above loadSegment).
+function assertTornWrite(
+  invalid: { readonly reason: string; readonly tornWritePossible: boolean },
+  cutPosition: number,
+  indexBytes: Buffer,
+  segmentBaseOffset: number,
+  recoverTail: boolean,
+): void {
+  const problem = `segment ${segmentBaseOffset}: ${invalid.reason}`;
+  // Rule 1
+  if (!recoverTail) {
+    throw new LogError("CORRUPT_LOG", `${problem}; sealed segments are never cut short`);
+  }
+  // Rule 2
+  if (!invalid.tornWritePossible) {
+    throw new LogError("CORRUPT_LOG", problem);
+  }
+  // Rule 3
+  if (indexListsPositionAtOrAfter(indexBytes, cutPosition)) {
+    throw new LogError(
+      "CORRUPT_LOG",
+      `${problem}, but the index shows data from that point was completely written`,
+    );
+  }
+}
+
+// Reads the raw entries even if parseIndex rejected the index: for this safety
+// check, any sign of durable data at or after `position` is reason to refuse.
+function indexListsPositionAtOrAfter(indexBytes: Buffer, position: number): boolean {
+  // A partly written last entry is ignored.
+  const completeBytes = indexBytes.length - (indexBytes.length % INDEX_ENTRY_SIZE);
+  for (let at = 0; at < completeBytes; at += INDEX_ENTRY_SIZE) {
+    if (indexBytes.readUInt32BE(at + 4) >= position) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Fsynced so the cut is durable before anything is appended after it. Uses its
+// own "r+" handle because Windows refuses to truncate through an append-mode one.
+async function truncateFile(path: string, length: number): Promise<void> {
+  const file = await open(path, "r+");
+  try {
+    await file.truncate(length);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
 }
 
 // A missing index file (new segment, or deleted) is treated as empty and rebuilt.
@@ -321,36 +426,42 @@ function parseIndex(
   return entries;
 }
 
-// Decodes batches from `fromPosition` to the end of the .log file, checking
-// that each one continues exactly where the previous one stopped.
-async function scanLog(
-  logFile: FileHandle,
-  fromPosition: number,
-  logSize: number,
-  expectedBaseOffset: number,
-): Promise<ScanResult> {
-  const contents = await readExactly(logFile, fromPosition, logSize - fromPosition);
+// Decodes batches from `bytes`, which begin at byte `startPosition` of the .log,
+// checking that each continues exactly where the previous one stopped. Stops at
+// the first invalid batch and returns the valid ones before it.
+function scanBatches(bytes: Buffer, startPosition: number, expectedBaseOffset: number): ScanResult {
   const batches: BatchLocation[] = [];
-  let position = 0; // within `contents`, not the file
+  let position = 0; // within `bytes`, not the file
   let nextOffset = expectedBaseOffset;
-  while (position < contents.length) {
-    const result = decodeBatch(contents, position);
-    const filePosition = fromPosition + position;
+  while (position < bytes.length) {
+    const result = decodeBatch(bytes, position);
+    const filePosition = startPosition + position;
     if (result.status !== "ok") {
       const detail = result.status === "corrupt" ? `corrupt (${result.reason})` : "incomplete";
-      return { ok: false, reason: `batch at byte ${filePosition} is ${detail}` };
+      return {
+        batches,
+        nextOffset,
+        endPosition: filePosition,
+        invalid: { reason: `batch at byte ${filePosition} is ${detail}`, tornWritePossible: true },
+      };
     }
     if (result.batch.baseOffset !== nextOffset) {
+      // Intact (valid checksum) but out of place, e.g. copied from another log.
       return {
-        ok: false,
-        reason: `batch at byte ${filePosition} has base offset ${result.batch.baseOffset}, expected ${nextOffset}`,
+        batches,
+        nextOffset,
+        endPosition: filePosition,
+        invalid: {
+          reason: `batch at byte ${filePosition} has base offset ${result.batch.baseOffset}, expected ${nextOffset}`,
+          tornWritePossible: false,
+        },
       };
     }
     batches.push({ baseOffset: nextOffset, position: filePosition, size: result.size });
     position += result.size;
     nextOffset += result.batch.records.length;
   }
-  return { ok: true, batches, nextOffset };
+  return { batches, nextOffset, endPosition: startPosition + position, invalid: null };
 }
 
 function encodeIndexEntry(relativeOffset: number, position: number): Buffer {

@@ -9,9 +9,8 @@ a broker.
 
 > **Status:** early development. The storage layer (log contract, in-memory
 > log, segmented file-backed log with an offset index, binary record batch
-> format) is implemented and tested;
-> crash recovery, networking, consumer groups, and replication are designed but
-> not yet built. EventRail uses its own wire
+> format, crash recovery) is implemented and tested; networking, consumer
+> groups, and replication are designed but not yet built. EventRail uses its own wire
 > protocol, is not production-ready, and has not been benchmarked. Sections
 > marked *(planned)* describe design targets, not current behavior.
 
@@ -97,8 +96,8 @@ without a network and the protocol can be tested without sockets.
            consumer groups, cluster metadata
  ───────────────────────────────────────────────────────────────────
  storage   Log contract, MemoryLog, FileLog, segments,   (implemented)
-           offset index, record batch format
-           crash recovery                                (planned)
+           offset index, record batch format,
+           crash recovery
 ```
 
 ### Cluster *(planned)*
@@ -174,10 +173,15 @@ orders-0/
 
 - **Write path.** Appends run one at a time through an in-process queue. The
   batch is encoded; if it would push a non-empty active segment past
-  `segmentMaxBytes` (default 16 MiB), a new segment is started at the batch's
-  offset. The batch is written to the `.log` and fsynced, then its index entry
-  is written. In-memory state is updated only after both writes succeed, so
-  reads never observe data that is not on disk.
+  `segmentMaxBytes` (default 16 MiB), the active segment is flushed and sealed,
+  and a new segment is started at the batch's offset. The batch is written to
+  the `.log` and fsynced, then its index entry is written. In-memory state is
+  updated only after both writes succeed, so reads never observe data that is
+  not on disk.
+- **The index only lists durable batches.** An index entry is written only
+  after an fsync of its batch has completed. With `syncOnAppend: false`,
+  entries wait in memory and are written when the segment is flushed: when it
+  is sealed, or when the log is closed cleanly. Crash recovery relies on this.
 - **Read path.** Binary search finds the segment containing the requested
   offset, then the batch within it; only the needed batches are read and
   decoded, continuing into later segments as required.
@@ -189,15 +193,34 @@ orders-0/
   partially written, non-increasing, or out-of-range index is rebuilt from a
   full scan of its `.log`.
 
+**Crash recovery.** A crash during an append can leave a torn write at the end
+of the active segment: part of a batch, or reserved bytes that never received
+their data. `FileLog.open` cuts the `.log` back to the end of its last valid
+batch, fsyncs the cut, rebuilds the index, and reports what it removed in
+`recoveredTail`. Cutting is safe because an append is acknowledged only after
+its batch is fsynced, so a torn batch was never acknowledged.
+
+Damage that a crash cannot explain is refused with `CORRUPT_LOG` and left
+untouched. The invalid data is cut off only when all three rules hold:
+
+1. It is in the active segment. Sealed segments are flushed before the log
+   moves past them, so a crash cannot tear them.
+2. It is incomplete or fails its checksum. A complete, valid batch with an
+   unexpected offset is not something a crash produces.
+3. The index lists no batch at or after the cut. Because the index only lists
+   durable batches, such an entry proves the data there was acknowledged.
+
 Durability and failure assumptions:
 
 | Situation | Behaviour |
 |---|---|
 | `syncOnAppend: true` (default) | An append resolves only after fsync, so acknowledged records survive power loss |
-| `syncOnAppend: false` | Records survive a process crash but may be lost on power loss or OS crash |
+| `syncOnAppend: false` | Records survive a process crash but may be lost on power loss or OS crash; data is fsynced when a segment is sealed and on a clean close |
 | Write or fsync fails | The log closes itself and rejects further use; fsync is never retried |
-| A `.log` ends in a partial batch, or its last batch is damaged | `open` rejects with `CORRUPT_LOG` (repair is planned as crash recovery) |
-| A batch earlier in a sealed segment is damaged | Not checked at startup; the read that reaches it rejects with `CORRUPT_LOG` |
+| An append fails after its batch reached the disk | The batch is kept on reopen; a producer that retries may store it twice |
+| The active segment ends in a torn write | Cut off on open and reported in `recoveredTail` |
+| Damage to a batch the index lists, or in a sealed segment | `open` rejects with `CORRUPT_LOG`; files are not modified |
+| A batch earlier in a segment is damaged, with valid data indexed after it | Usually not detected at startup (only the last indexed batch is re-checked); never cut off; the read that reaches it rejects with `CORRUPT_LOG` |
 | Index damaged or missing | Rebuilt from the `.log` on open |
 | A segment file is missing from the middle or start | `open` rejects with `CORRUPT_LOG` |
 | Power loss right after a new segment file is created | The directory entry is not fsynced, so on some file systems the new file may not survive |
@@ -225,13 +248,13 @@ src/
   storage/log.ts           Log interface and LogError
   storage/memory-log.ts    in-memory Log implementation
   storage/file-log.ts      file-backed Log: segment list, rolling, append queue
-  storage/segment.ts       one .log/.index pair: append, read, index load/repair
+  storage/segment.ts       one .log/.index pair: append, read, index repair, crash recovery
   storage/record-batch.ts  binary record batch encoding and decoding
 test/
   helpers/temp-dir.ts      per-test temporary directories
   storage/log-contract.ts  contract tests every Log implementation must pass
   storage/memory-log.test.ts
-  storage/file-log.test.ts contract, persistence, segment, and index-repair tests
+  storage/file-log.test.ts contract, persistence, segment, index-repair, and recovery tests
   storage/record-batch.test.ts
 ```
 
@@ -241,10 +264,18 @@ test/
   [test/storage/log-contract.ts](test/storage/log-contract.ts) and run against
   every implementation, so `MemoryLog` and `FileLog` are held to identical
   rules, including concurrent appends issued without awaiting each other.
+  `FileLog` runs the suite three times: default segments, tiny segments, and
+  tiny segments without fsync per append.
 - **Persistence tests.** `FileLog` is closed and reopened to verify records and
   offsets survive, and its file is compared byte for byte with the expected
-  encoded batches. Partially written, damaged, and non-contiguous files are
-  verified to be refused.
+  encoded batches.
+- **Crash recovery tests.** Torn writes are simulated by editing files: a
+  final batch cut after every possible byte, trailing zero bytes, a garbled
+  unindexed batch, a torn first batch in a new segment, and a crash with
+  index entries still pending. Each must be cut off and the log must keep
+  working. Damage that a crash cannot explain (an indexed batch, a sealed
+  segment, a valid batch with the wrong offset, damage followed by indexed
+  data) must be refused with the files left byte-for-byte unchanged.
 - **Segment and index tests.** Rolling, oversized batches, exact index bytes,
   missing segment files, and five kinds of index damage (missing, truncated,
   partial entry, non-increasing, out of range), each of which must be repaired
@@ -254,8 +285,8 @@ test/
 - **Exhaustive damage tests.** The record batch decoder is checked against a
   batch truncated at every possible byte (always `incomplete`) and a batch
   with each single byte damaged (never accepted).
-- **Planned fault-injection tests** will cover truncated segment files, killed
-  leaders, lagging followers, and stale consumer group members.
+- **Planned fault-injection tests** will cover killed leaders, lagging
+  followers, and stale consumer group members.
 
 ## Roadmap
 
@@ -264,7 +295,7 @@ test/
 - [x] Binary record batch format with CRC32 checksums
 - [x] File-backed log: single file, serialized appends, fsync per append
 - [x] Segmented log files with a persistent offset index
-- [ ] Crash recovery: torn-write detection and truncation
+- [x] Crash recovery: torn-write detection and truncation
 - [ ] Topics and partitions with key-based routing
 - [ ] Wire protocol, TCP server, producer and consumer clients
 - [ ] Consumer groups and committed offsets
