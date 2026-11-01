@@ -3,7 +3,7 @@
 // and with tiny segments and no fsync per append.
 // Part 2 covers persistence across restarts, the exact on-disk bytes, and
 // refusing data that doesn't belong. Part 3 covers rolling, index repair, and
-// missing segment files. Part 4 covers crash recovery (Milestone 3).
+// missing segment files. Part 4 covers crash recovery.
 
 import { after, afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";

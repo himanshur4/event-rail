@@ -9,8 +9,9 @@ a broker.
 
 > **Status:** early development. The storage layer (log contract, in-memory
 > log, segmented file-backed log with an offset index, binary record batch
-> format, crash recovery) is implemented and tested; networking, consumer
-> groups, and replication are designed but not yet built. EventRail uses its own wire
+> format, crash recovery) and topics with key-partitioned logs are implemented
+> and tested; networking, consumer groups, and replication are designed but
+> not yet built. EventRail uses its own wire
 > protocol, is not production-ready, and has not been benchmarked. Sections
 > marked *(planned)* describe design targets, not current behavior.
 
@@ -95,6 +96,8 @@ without a network and the protocol can be tested without sockets.
  broker    request routing, replication,                 (planned)
            consumer groups, cluster metadata
  ───────────────────────────────────────────────────────────────────
+ topic     TopicManager, partitioner, topic metadata     (implemented)
+ ───────────────────────────────────────────────────────────────────
  storage   Log contract, MemoryLog, FileLog, segments,   (implemented)
            offset index, record batch format,
            crash recovery
@@ -164,7 +167,7 @@ as a series of segment files in one directory. It passes the same contract
 suite as `MemoryLog`, both with default and with deliberately tiny segments.
 
 ```
-orders-0/
+topics/orders/0/              one partition's log directory
   00000000000000000000.log    sealed segment: batches for offsets 0..999
   00000000000000000000.index  one 8-byte entry per batch: relative offset, byte position
   00000000000000001000.log    active segment: new batches are appended here
@@ -210,6 +213,41 @@ untouched. The invalid data is cut off only when all three rules hold:
 3. The index lists no batch at or after the cut. Because the index only lists
    durable batches, such an entry proves the data there was acknowledged.
 
+**Topics and partitions** ([src/topic/](src/topic/)). A topic is a named set
+of partitions, and each partition is an independent `FileLog` with its own
+offsets, append queue, and crash recovery. `TopicManager` creates topics,
+opens all of them at startup, and returns the `Log` for a given
+`(topic, partition)`.
+
+```
+<dataDir>/topics/
+  orders/
+    topic.json   {"version":1,"name":"orders","partitionCount":3}
+    0/  1/  2/   one FileLog directory per partition
+```
+
+- **Key-based routing.** `Partitioner` maps a record with a key to
+  `murmur3(key) % partitionCount`, so every record with the same key goes to
+  the same partition and stays in order. Records without a key are spread
+  round-robin. The hash is MurmurHash3 (x86_32, seed 0), pinned by tests to its
+  published values, because changing it would move existing keys to different
+  partitions. Ordering is guaranteed per partition, not across a topic.
+- **Creation has a commit point.** Partition directories are created first, and
+  `topic.json` is written last, atomically (temporary file, fsync, rename). A
+  directory without `topic.json` is a creation that never finished: it is
+  ignored at startup and replaced if the topic is created again.
+- **Names are safe directory names.** Lowercase letters, digits, `.`, `_`, and
+  `-`, starting with a letter or digit, at most 100 characters, not ending in
+  `.`, and not a Windows device name (`con`, `nul`, `com1`, ...). Lowercase
+  only, because case-insensitive file systems would map `Orders` and `orders`
+  to the same directory.
+- **Startup checks.** A `topic.json` that is invalid, has an unknown version,
+  or names a different topic, and a missing partition directory, are refused
+  with `CORRUPT_TOPIC` rather than silently replaced by an empty log. Torn
+  writes repaired in any partition are reported in `recoveredTails`.
+- **Partition counts are fixed** once a topic is created (1 to 1000), since
+  changing the count would change which partition each key maps to.
+
 Durability and failure assumptions:
 
 | Situation | Behaviour |
@@ -223,7 +261,9 @@ Durability and failure assumptions:
 | A batch earlier in a segment is damaged, with valid data indexed after it | Usually not detected at startup (only the last indexed batch is re-checked); never cut off; the read that reaches it rejects with `CORRUPT_LOG` |
 | Index damaged or missing | Rebuilt from the `.log` on open |
 | A segment file is missing from the middle or start | `open` rejects with `CORRUPT_LOG` |
-| Power loss right after a new segment file is created | The directory entry is not fsynced, so on some file systems the new file may not survive |
+| A crash while a topic is being created | No `topic.json`, so the directory is not a topic; it is replaced if the topic is created again |
+| `topic.json` damaged, or a partition directory missing | `TopicManager.open` rejects with `CORRUPT_TOPIC` |
+| Power loss right after a new file or directory is created (segment, topic) | Directory entries are not fsynced, so on some file systems the new entry may not survive |
 | Two processes open the same directory | Not supported and not yet detected |
 
 ## Getting started
@@ -250,12 +290,17 @@ src/
   storage/file-log.ts      file-backed Log: segment list, rolling, append queue
   storage/segment.ts       one .log/.index pair: append, read, index repair, crash recovery
   storage/record-batch.ts  binary record batch encoding and decoding
+  topic/partitioner.ts     key hashing (MurmurHash3) and round-robin partition choice
+  topic/topic-metadata.ts  topic name rules, TopicError, atomic topic.json
+  topic/topic-manager.ts   creates and opens topics; routes to partition logs
 test/
   helpers/temp-dir.ts      per-test temporary directories
   storage/log-contract.ts  contract tests every Log implementation must pass
   storage/memory-log.test.ts
   storage/file-log.test.ts contract, persistence, segment, index-repair, and recovery tests
   storage/record-batch.test.ts
+  topic/partitioner.test.ts
+  topic/topic-manager.test.ts
 ```
 
 ## Testing approach
@@ -280,6 +325,15 @@ test/
   missing segment files, and five kinds of index damage (missing, truncated,
   partial entry, non-increasing, out of range), each of which must be repaired
   back to the original index.
+- **Partitioning tests.** The hash is pinned to MurmurHash3's published values;
+  10,000 keys must spread evenly over 8 partitions; keys differing in a single
+  bit must not systematically share a partition; and records for interleaved
+  keys, routed through the partitioner, must come back in sending order from
+  their partition.
+- **Topic tests.** On-disk layout, restarts, half-created topics left by a
+  crash, six kinds of damaged `topic.json`, a missing partition directory,
+  per-partition recovery reports, concurrent creates of the same name, and
+  `close()` waiting for a creation in progress.
 - **Failure cases are first-class.** Invalid arguments, empty batches, and
   out-of-range reads are tested alongside the normal path.
 - **Exhaustive damage tests.** The record batch decoder is checked against a
@@ -296,7 +350,7 @@ test/
 - [x] File-backed log: single file, serialized appends, fsync per append
 - [x] Segmented log files with a persistent offset index
 - [x] Crash recovery: torn-write detection and truncation
-- [ ] Topics and partitions with key-based routing
+- [x] Topics and partitions with key-based routing
 - [ ] Wire protocol, TCP server, producer and consumer clients
 - [ ] Consumer groups and committed offsets
 - [ ] Multi-broker cluster with a controller
@@ -313,6 +367,9 @@ test/
   until it restarts.
 - **Offsets as JavaScript numbers.** Offsets are exact up to 2^53 − 1, far
   beyond any realistic log length for this project.
+- **Partitioning happens in the producer** *(client planned)*. The broker's
+  storage is addressed by `(topic, partition)`; choosing the partition from the
+  key is the producer's job, as in the record lifecycle above.
 - **Non-goals:** consensus-based controller election, exactly-once semantics
   and transactions, log compaction, zero-copy transfer, compatibility with
   existing broker wire protocols, compression, and authentication/TLS.
