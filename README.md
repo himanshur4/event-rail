@@ -9,9 +9,11 @@ a broker.
 
 > **Status:** early development. The storage layer (log contract, in-memory
 > log, segmented file-backed log with an offset index, binary record batch
-> format, crash recovery) and topics with key-partitioned logs are implemented
-> and tested; networking, consumer groups, and replication are designed but
-> not yet built. EventRail uses its own wire
+> format, crash recovery), topics with key-partitioned logs, the binary wire
+> protocol, a single-broker TCP server, and producer, consumer, and admin
+> clients with a command-line tool are implemented and tested; consumer groups,
+> the multi-broker cluster, and replication are designed but not yet built.
+> EventRail uses its own wire
 > protocol, is not production-ready, and has not been benchmarked. Sections
 > marked *(planned)* describe design targets, not current behavior.
 
@@ -89,12 +91,13 @@ Each layer depends only on the layers below it, so storage can be tested
 without a network and the protocol can be tested without sockets.
 
 ```
- client    producer, consumer, admin                     (planned)
+ client    producer, consumer, admin, CLI                (implemented)
  ─────────────── TCP, length-prefixed frames ───────────────────────
- network   server, connections, request codec            (planned)
+ network   framing, field encoding, message codec        (implemented)
+           TCP server, per-connection request queue      (implemented)
  ───────────────────────────────────────────────────────────────────
- broker    request routing, replication,                 (planned)
-           consumer groups, cluster metadata
+ broker    request handling (single broker)              (implemented)
+           replication, consumer groups, metadata        (planned)
  ───────────────────────────────────────────────────────────────────
  topic     TopicManager, partitioner, topic metadata     (implemented)
  ───────────────────────────────────────────────────────────────────
@@ -248,6 +251,60 @@ opens all of them at startup, and returns the `Log` for a given
 - **Partition counts are fixed** once a topic is created (1 to 1000), since
   changing the count would change which partition each key maps to.
 
+**Wire protocol** ([src/protocol/](src/protocol/)). TCP is a byte stream
+without message boundaries, so every message travels as a frame: a 4-byte
+big-endian length followed by the payload. `FrameDecoder` rebuilds whole frames
+from chunks split at any byte, copying each byte once, and rejects a frame
+whose announced length exceeds the limit (8 MiB by default) before accepting
+any of its payload. `BinaryWriter` and `BinaryReader` encode the fields
+messages are built from: big-endian `u8`, `u16`, `u32`, `i32`, `u64`, `i64`,
+length-prefixed UTF-8 strings, and byte fields with `-1` meaning null. Every
+read is bounds-checked, invalid UTF-8 and leftover bytes are rejected, and all
+malformed input raises `ProtocolError` rather than crashing.
+
+Every payload, request or response, starts with the same 8-byte header:
+`apiKey u16 | apiVersion u16 | correlationId u32`. Four APIs are defined, all
+at version 0: `createTopic`, `metadata`, `produce` (records for one partition),
+and `fetch` (records from one partition, with its log end offset). A response
+repeats its request's header, so a client can match it to the request, then
+carries an error number: `0` followed by the API's fields, or a nonzero number
+followed by a message. Every error code of every layer has a permanent wire
+number, and the compiler rejects a code without one. Decoding an unknown API
+or version raises `UNSUPPORTED_VERSION` instead of misreading the body, and an
+error response can be encoded for any header. The codec checks only a message's
+shape; topic and log rules stay in `TopicManager` and the log.
+
+**Broker server** ([src/server/](src/server/), [src/broker/](src/broker/)).
+`BrokerServer` listens on TCP (127.0.0.1:7400 by default) and gives each
+connection its own `FrameDecoder` and request queue. Requests on one connection
+are carried out one at a time, in arrival order, so a producer's batches are
+stored in the order it sent them; separate connections are served concurrently.
+`RequestHandler` maps each request onto `TopicManager` and the partition logs, so
+a produce response is sent only after the append has completed (and been fsynced
+by default). The broker enforces two size rules: a record's key and value may
+total at most 1 MiB, and a fetch response holds only as many records as fit in
+one frame, but always at least one, so every stored record can be fetched and a
+consumer always makes progress. A frame that is too large or too short for a
+header closes that one connection; any other failure is answered with an error
+response and the connection stays open. Unexpected errors are reported as
+`UNKNOWN_SERVER_ERROR` without internal details. Each connection pauses reading
+while 32 requests are waiting and while the client is not reading its answers;
+idle connections close after 10 minutes, and at most 1000 connections are
+accepted. `close()` stops accepting connections, answers every request already
+received, then closes the connections; storage is closed after it.
+
+**Clients** ([src/client/](src/client/)). `Connection` sends requests with
+increasing correlation IDs and resolves each one when the answer with its ID
+arrives, so many requests can be in flight on one connection. Each request times
+out after 30 seconds; a late answer is discarded rather than given to another
+request. An error response rejects with `BrokerError` (the request was not
+carried out); a closed connection, a timeout, or an invalid answer rejects with
+`ConnectionError` (the request may or may not have been carried out). `Admin`
+creates and lists topics. `Producer` fetches a topic's partition count once,
+chooses each record's partition with the partitioner, sends one produce request
+per partition, and returns each record's partition and offset. `Consumer` reads
+one partition from a position it keeps in memory and reports its lag.
+
 Durability and failure assumptions:
 
 | Situation | Behaviour |
@@ -280,6 +337,18 @@ npm test           # build, then run the test suite with node:test
 The build refuses to emit output when there are type errors
 (`noEmitOnError`), so tests never run against code that failed type checking.
 
+Run a broker and talk to it from other terminals:
+
+```sh
+node dist/src/cli.js broker --data ./data            # Ctrl+C stops it cleanly
+node dist/src/cli.js create-topic orders --partitions 3
+node dist/src/cli.js produce orders "order placed" --key user-4
+node dist/src/cli.js consume orders                  # add --follow to keep reading
+node dist/src/cli.js topics
+```
+
+Every command accepts `--host` and `--port` (default `127.0.0.1:7400`).
+
 ## Code layout
 
 ```
@@ -293,6 +362,23 @@ src/
   topic/partitioner.ts     key hashing (MurmurHash3) and round-robin partition choice
   topic/topic-metadata.ts  topic name rules, TopicError, atomic topic.json
   topic/topic-manager.ts   creates and opens topics; routes to partition logs
+  protocol/frame.ts        length-prefixed frames and the streaming FrameDecoder
+  protocol/binary.ts       BinaryWriter and BinaryReader for message fields
+  protocol/messages.ts     request and response types, API keys, message header
+  protocol/codec.ts        encodes and decodes every request and response
+  protocol/error-codes.ts  permanent wire numbers for every error code
+  protocol/protocol-error.ts  ProtocolError for malformed or unsupported input
+  broker/request-handler.ts  carries out requests against TopicManager; size rules
+  broker/request-error.ts  RequestError (RECORD_TOO_LARGE)
+  server/broker-server.ts  TCP listener, connection limit, graceful shutdown
+  server/server-connection.ts  one connection: framing, ordered queue, back-pressure
+  client/connection.ts     correlation IDs, pending requests, timeouts
+  client/client-errors.ts  BrokerError and ConnectionError
+  client/admin.ts          create and list topics
+  client/producer.ts       partition choice, one request per partition
+  client/consumer.ts       reads one partition from an in-memory position
+  common/network-defaults.ts  default host and port
+  cli.ts                   command-line tool: broker, topics, produce, consume
 test/
   helpers/temp-dir.ts      per-test temporary directories
   storage/log-contract.ts  contract tests every Log implementation must pass
@@ -301,6 +387,14 @@ test/
   storage/record-batch.test.ts
   topic/partitioner.test.ts
   topic/topic-manager.test.ts
+  protocol/frame.test.ts
+  protocol/binary.test.ts
+  protocol/codec.test.ts
+  protocol/error-codes.test.ts
+  broker/request-handler.test.ts
+  server/broker-server.test.ts  raw-socket tests of the server
+  client/client.test.ts    clients against a real broker, end to end
+  client/connection.test.ts  the client against a misbehaving fake broker
 ```
 
 ## Testing approach
@@ -334,6 +428,21 @@ test/
   crash, six kinds of damaged `topic.json`, a missing partition directory,
   per-partition recovery reports, concurrent creates of the same name, and
   `close()` waiting for a creation in progress.
+- **Protocol tests.** A frame split into two chunks at every possible byte, a
+  stream delivered one byte at a time, an oversized length rejected from its
+  4-byte header alone, and every field type round-tripped at its extreme
+  values. Every request and response round-trips, four messages are pinned to
+  their exact documented bytes, and each message cut short at every possible
+  byte must raise `MALFORMED_MESSAGE`, as must impossible lengths, invalid
+  UTF-8, and leftover bytes. The error-number table is pinned by an
+  independent copy in the tests.
+- **Server and client tests.** The server is tested over real sockets with a
+  raw client: requests pipelined in one write are answered in order, a client
+  that disconnects mid-request leaves no trace, oversized and header-less frames
+  close only their own connection, and shutdown answers every request already
+  received. The client is tested against a fake broker that answers out of
+  order, too late, for the wrong API, or not at all. End-to-end tests run
+  producer, broker, and consumer together, including across a broker restart.
 - **Failure cases are first-class.** Invalid arguments, empty batches, and
   out-of-range reads are tested alongside the normal path.
 - **Exhaustive damage tests.** The record batch decoder is checked against a
@@ -351,7 +460,7 @@ test/
 - [x] Segmented log files with a persistent offset index
 - [x] Crash recovery: torn-write detection and truncation
 - [x] Topics and partitions with key-based routing
-- [ ] Wire protocol, TCP server, producer and consumer clients
+- [x] Wire protocol, TCP server, producer and consumer clients
 - [ ] Consumer groups and committed offsets
 - [ ] Multi-broker cluster with a controller
 - [ ] Replication: in-sync replicas, high watermark, `acks=0/1/all`
@@ -367,9 +476,23 @@ test/
   until it restarts.
 - **Offsets as JavaScript numbers.** Offsets are exact up to 2^53 − 1, far
   beyond any realistic log length for this project.
-- **Partitioning happens in the producer** *(client planned)*. The broker's
+- **Partitioning happens in the producer.** The broker's
   storage is addressed by `(topic, partition)`; choosing the partition from the
   key is the producer's job, as in the record lifecycle above.
+- **One partition per produce or fetch request.** Each request has a single
+  error code rather than one per partition; writing to several partitions
+  takes several requests.
+- **At-least-once on failure.** A produce that fails with `ConnectionError` may
+  already have been stored; retrying it can store the records twice.
+- **No consumer offsets yet.** A `Consumer` keeps its position in memory only,
+  and fetching is polling (no waiting on the broker for new records). Committed
+  offsets are part of the planned consumer groups.
+- **No authentication or encryption.** The broker listens on 127.0.0.1 by
+  default; exposing it to a network is a deliberate choice.
+- **A producer send is one request per partition.** Large sends are not split
+  into several requests, so each partition's share must fit in one frame, and a
+  send is not atomic across partitions: if one partition's request fails, the
+  others may still have been stored.
 - **Non-goals:** consensus-based controller election, exactly-once semantics
   and transactions, log compaction, zero-copy transfer, compatibility with
   existing broker wire protocols, compression, and authentication/TLS.
