@@ -2,12 +2,16 @@
   "name": "eventrail",
   "version": "0.0.0",
   "private": true,
-  "description": "A distributed, persistent event streaming broker with partitioned, replicated logs.",
+  "description": "A persistent event streaming broker with partitioned logs and consumer groups.",
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "test": "npm run build && node --test \"dist/test/**/*.test.js\""
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
+    "demo:reset": "node scripts/demo.mjs reset",
+    "demo:broker": "node scripts/demo.mjs broker",
+    "demo:files": "node scripts/demo.mjs files",
+    "demo:crash": "node scripts/demo.mjs crash"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
