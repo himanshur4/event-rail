@@ -1,21 +1,19 @@
 # EventRail
 
-EventRail is a distributed, persistent event streaming broker written in
-TypeScript on Node.js. Producers append records to partitioned, append-only
-logs; consumers read those logs by offset, coordinate through consumer groups,
-and commit their progress. Partitions are replicated across brokers with
-leader-follower replication so that acknowledged records survive the loss of
-a broker.
+EventRail is a persistent event streaming broker written in TypeScript on
+Node.js. Producers append records to partitioned, append-only logs on disk;
+consumers read those logs by offset, split a topic's partitions through
+consumer groups, and commit their progress so that another member can continue
+where they stopped.
 
-> **Status:** early development. The storage layer (log contract, in-memory
-> log, segmented file-backed log with an offset index, binary record batch
-> format, crash recovery), topics with key-partitioned logs, the binary wire
-> protocol, a single-broker TCP server, and producer, consumer, and admin
-> clients with a command-line tool are implemented and tested; consumer groups,
-> the multi-broker cluster, and replication are designed but not yet built.
-> EventRail uses its own wire
-> protocol, is not production-ready, and has not been benchmarked. Sections
-> marked *(planned)* describe design targets, not current behavior.
+> **Status:** complete for its single-broker scope. Segmented, checksummed logs
+> with crash recovery, key-partitioned topics, a binary wire protocol, a TCP
+> broker server, producer, consumer, and admin clients with a command-line tool,
+> and consumer groups with committed offsets are implemented and tested. A
+> multi-broker cluster with replication and leader failover is designed but not
+> built; sections marked *(planned)* describe that design, not current behavior.
+> EventRail uses its own wire protocol, is not production-ready, and has not
+> been benchmarked.
 
 ## Contents
 
@@ -78,7 +76,7 @@ Consumer group member assigned to that partition
 - **Consumer groups.** Members of a group split a topic's partitions between
   them; each partition is read by exactly one member. A coordinator tracks
   membership through heartbeats and reassigns partitions when members join or
-  fail. Committed offsets are stored in an internal, replicated topic.
+  fail. Committed offsets are stored in an internal log on the broker.
 - **Durability on disk.** Each partition log is stored as segment files of
   CRC-checked record batches plus an offset index. On restart, the broker
   scans the newest segment and truncates any partially written batch.
@@ -97,7 +95,8 @@ without a network and the protocol can be tested without sockets.
            TCP server, per-connection request queue      (implemented)
  ───────────────────────────────────────────────────────────────────
  broker    request handling (single broker)              (implemented)
-           replication, consumer groups, metadata        (planned)
+           consumer groups, committed offsets            (implemented)
+           replication, cluster metadata                 (planned)
  ───────────────────────────────────────────────────────────────────
  topic     TopicManager, partitioner, topic metadata     (implemented)
  ───────────────────────────────────────────────────────────────────
@@ -263,9 +262,11 @@ read is bounds-checked, invalid UTF-8 and leftover bytes are rejected, and all
 malformed input raises `ProtocolError` rather than crashing.
 
 Every payload, request or response, starts with the same 8-byte header:
-`apiKey u16 | apiVersion u16 | correlationId u32`. Four APIs are defined, all
+`apiKey u16 | apiVersion u16 | correlationId u32`. Nine APIs are defined, all
 at version 0: `createTopic`, `metadata`, `produce` (records for one partition),
-and `fetch` (records from one partition, with its log end offset). A response
+`fetch` (records from one partition, with its log end offset), and the consumer
+group APIs `joinGroup`, `heartbeat`, `leaveGroup`, `commitOffset`, and
+`fetchOffset`. A response
 repeats its request's header, so a client can match it to the request, then
 carries an error number: `0` followed by the API's fields, or a nonzero number
 followed by a message. Every error code of every layer has a permanent wire
@@ -279,8 +280,8 @@ shape; topic and log rules stay in `TopicManager` and the log.
 connection its own `FrameDecoder` and request queue. Requests on one connection
 are carried out one at a time, in arrival order, so a producer's batches are
 stored in the order it sent them; separate connections are served concurrently.
-`RequestHandler` maps each request onto `TopicManager` and the partition logs, so
-a produce response is sent only after the append has completed (and been fsynced
+`RequestHandler` maps each request onto `TopicManager`, the partition logs, and
+the group coordinator, so a produce response is sent only after the append has completed (and been fsynced
 by default). The broker enforces two size rules: a record's key and value may
 total at most 1 MiB, and a fetch response holds only as many records as fit in
 one frame, but always at least one, so every stored record can be fetched and a
@@ -305,6 +306,40 @@ chooses each record's partition with the partitioner, sends one produce request
 per partition, and returns each record's partition and offset. `Consumer` reads
 one partition from a position it keeps in memory and reports its lag.
 
+**Consumer groups** ([src/group/](src/group/),
+[src/client/group-consumer.ts](src/client/group-consumer.ts)). The members of a
+group split one topic's partitions between them, so each partition is read by
+one member at a time. The broker's `GroupCoordinator` keeps the membership in
+memory, and the server checks its timeouts every 100 ms.
+
+- **Rebalancing.** A member that joins, leaves, or goes silent starts a
+  rebalance: every member must join again, and joins are answered "waiting"
+  until all members have rejoined or the rebalance timeout (10 s) removes those
+  that did not. The partitions are then assigned round-robin in join order, and
+  the group's generation number increases by one.
+- **Liveness.** Members send heartbeats; one that is silent for the session
+  timeout (10 s) is removed. A heartbeat during a rebalance is answered
+  `REBALANCE_IN_PROGRESS`, which is how members learn they must join again.
+- **Fencing.** Heartbeats and commits carry the member's generation. An older
+  generation is refused with `STALE_GENERATION`, and a commit for a partition
+  the member does not own with `NOT_PARTITION_OWNER`, so a member that missed a
+  rebalance cannot overwrite the progress of the partition's new owner. During a
+  rebalance, commits with the current generation are still accepted, so members
+  can save their progress before they rejoin.
+- **Committed offsets.** `OffsetStore` keeps each group's committed offset per
+  topic partition: the next offset the group will read. Every commit is
+  appended as one record to an internal `FileLog`, outside `data/topics/`, so it
+  is never listed or reachable as a topic, and is acknowledged only after it is
+  fsynced. On startup the store replays the log and keeps the latest commit for
+  each partition, after the log's crash recovery has cut off any torn commit. A
+  record that does not decode as a commit stops the store from opening
+  (`CORRUPT_LOG`).
+- **`GroupConsumer`** joins, sends heartbeats in the background, and polls its
+  partitions from the group's committed offsets (offset 0 if there are none).
+  It commits when asked, before it rejoins, and before it leaves. Delivery is at
+  least once: records read after the last commit are read again by the
+  partition's next owner.
+
 Durability and failure assumptions:
 
 | Situation | Behaviour |
@@ -321,6 +356,8 @@ Durability and failure assumptions:
 | A crash while a topic is being created | No `topic.json`, so the directory is not a topic; it is replaced if the topic is created again |
 | `topic.json` damaged, or a partition directory missing | `TopicManager.open` rejects with `CORRUPT_TOPIC` |
 | Power loss right after a new file or directory is created (segment, topic) | Directory entries are not fsynced, so on some file systems the new entry may not survive |
+| A group member stops without leaving | Removed after the session timeout; its partitions are reassigned, and records it read after its last commit are read again |
+| The broker restarts | Committed offsets survive; group membership does not, so consumers must join again |
 | Two processes open the same directory | Not supported and not yet detected |
 
 ## Getting started
@@ -344,8 +381,13 @@ node dist/src/cli.js broker --data ./data            # Ctrl+C stops it cleanly
 node dist/src/cli.js create-topic orders --partitions 3
 node dist/src/cli.js produce orders "order placed" --key user-4
 node dist/src/cli.js consume orders                  # add --follow to keep reading
+node dist/src/cli.js consume orders --group billing --follow
 node dist/src/cli.js topics
 ```
+
+Several values in one `produce` command are sent as one batch. Run the group
+command in two terminals to see the partitions split between them; stopping one
+with Ctrl+C hands its partitions to the other.
 
 Every command accepts `--host` and `--port` (default `127.0.0.1:7400`).
 
@@ -378,9 +420,14 @@ src/
   client/producer.ts       partition choice, one request per partition
   client/consumer.ts       reads one partition from an in-memory position
   common/network-defaults.ts  default host and port
+  group/offset-store.ts    committed offsets of consumer groups, in an internal log
+  group/group-coordinator.ts  membership, rebalances, generations, partition assignment
+  group/group-error.ts     GroupError and its codes
+  client/group-consumer.ts joins a group, sends heartbeats, polls and commits its partitions
   cli.ts                   command-line tool: broker, topics, produce, consume
 test/
   helpers/temp-dir.ts      per-test temporary directories
+  helpers/groups.ts        a group coordinator with its offset store, for tests
   storage/log-contract.ts  contract tests every Log implementation must pass
   storage/memory-log.test.ts
   storage/file-log.test.ts contract, persistence, segment, index-repair, and recovery tests
@@ -395,6 +442,9 @@ test/
   server/broker-server.test.ts  raw-socket tests of the server
   client/client.test.ts    clients against a real broker, end to end
   client/connection.test.ts  the client against a misbehaving fake broker
+  group/offset-store.test.ts  replay, last commit wins, torn commits, bad records
+  group/group-coordinator.test.ts  rebalances, timeouts, and fencing on a fake clock
+  client/group-consumer.test.ts  group members against a real broker
 ```
 
 ## Testing approach
@@ -448,8 +498,12 @@ test/
 - **Exhaustive damage tests.** The record batch decoder is checked against a
   batch truncated at every possible byte (always `incomplete`) and a batch
   with each single byte damaged (never accepted).
-- **Planned fault-injection tests** will cover killed leaders, lagging
-  followers, and stale consumer group members.
+- **Consumer group tests.** The coordinator runs on a fake clock, so session
+  and rebalance timeouts are tested without waiting: members that go silent or
+  do not rejoin are removed, and stale generations, removed members, and
+  non-owners cannot commit. End to end, group members on separate connections
+  split partitions, take over after a leave or a crash, continue from
+  committed offsets, and commit their progress before a rebalance.
 
 ## Roadmap
 
@@ -461,7 +515,7 @@ test/
 - [x] Crash recovery: torn-write detection and truncation
 - [x] Topics and partitions with key-based routing
 - [x] Wire protocol, TCP server, producer and consumer clients
-- [ ] Consumer groups and committed offsets
+- [x] Consumer groups and committed offsets
 - [ ] Multi-broker cluster with a controller
 - [ ] Replication: in-sync replicas, high watermark, `acks=0/1/all`
 - [ ] Leader failover with leader epochs
@@ -484,9 +538,11 @@ test/
   takes several requests.
 - **At-least-once on failure.** A produce that fails with `ConnectionError` may
   already have been stored; retrying it can store the records twice.
-- **No consumer offsets yet.** A `Consumer` keeps its position in memory only,
-  and fetching is polling (no waiting on the broker for new records). Committed
-  offsets are part of the planned consumer groups.
+- **Consumer group limits.** A group reads one topic; membership is kept in
+  memory; every rebalance pauses the whole group until all members have
+  rejoined; and the offsets log is not compacted, so it grows with every
+  commit. A plain `Consumer` keeps its position in memory only, and fetching is
+  polling (no waiting on the broker for new records).
 - **No authentication or encryption.** The broker listens on 127.0.0.1 by
   default; exposing it to a network is a deliberate choice.
 - **A producer send is one request per partition.** Large sends are not split

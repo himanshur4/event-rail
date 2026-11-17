@@ -7,7 +7,9 @@ import { parseArgs } from "node:util";
 import { Admin } from "./client/admin.js";
 import { Connection } from "./client/connection.js";
 import { Consumer } from "./client/consumer.js";
+import { GroupConsumer } from "./client/group-consumer.js";
 import { Producer } from "./client/producer.js";
+import type { LogRecord } from "./common/types.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "./common/network-defaults.js";
 import { GroupCoordinator } from "./group/group-coordinator.js";
 import { OffsetStore } from "./group/offset-store.js";
@@ -20,9 +22,11 @@ Commands:
   broker [--data <dir>]                              run a broker (Ctrl+C to stop)
   create-topic <name> [--partitions <n>]             create a topic (default 1 partition)
   topics                                             list topics
-  produce <topic> <value> [--key <key>]              send one record
+  produce <topic> <value>... [--key <key>]           send records (several values = one batch)
   consume <topic> [--partition <n>] [--from <offset>] [--follow]
                                                      print records (all partitions by default)
+  consume <topic> --group <id> [--follow]            read as a member of a consumer group:
+                                                     share partitions, continue from commits
 
 Options for every command:
   --host <address>   broker address (default ${DEFAULT_HOST})
@@ -44,6 +48,7 @@ async function main(argv: string[]): Promise<void> {
       key: { type: "string" },
       from: { type: "string", default: "0" },
       follow: { type: "boolean", default: false },
+      group: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
@@ -77,15 +82,25 @@ async function main(argv: string[]): Promise<void> {
       });
     case "produce": {
       const topic = required(args[0], "a topic name");
-      const value = required(args[1], "a value");
+      required(args[1], "a value");
+      // Every value after the topic is one record; they're sent together in one
+      // send(), so each partition receives them as a single batch.
+      const recordValues = args.slice(1);
       const key = values.key === undefined ? null : Buffer.from(values.key);
       return withConnection(host, port, async (connection) => {
-        const [stored] = await new Producer(connection).send(topic, [{ key, value: Buffer.from(value) }]);
-        console.log(`stored in ${topic} partition ${stored!.partition} at offset ${stored!.offset}`);
+        const records = recordValues.map((value) => ({ key, value: Buffer.from(value) }));
+        const stored = await new Producer(connection).send(topic, records);
+        for (const [i, place] of stored.entries()) {
+          console.log(`"${recordValues[i]}" stored in ${topic} partition ${place.partition} at offset ${place.offset}`);
+        }
       });
     }
     case "consume": {
       const topic = required(args[0], "a topic name");
+      const group = values.group;
+      if (group !== undefined) {
+        return withConnection(host, port, (connection) => consumeAsGroup(connection, topic, group, values.follow));
+      }
       const from = parseInteger(values.from, "--from");
       const partition = values.partition === undefined ? null : parseInteger(values.partition, "--partition");
       return withConnection(host, port, (connection) => consume(connection, topic, partition, from, values.follow));
@@ -151,8 +166,7 @@ async function consume(
     for (const consumer of consumers) {
       const records = await consumer.poll();
       for (const record of records) {
-        const key = record.key === null ? "(none)" : record.key.toString();
-        console.log(`${topic}/${consumer.partition} offset ${record.offset}  key=${key}  value=${record.value.toString()}`);
+        printRecord(topic, consumer.partition, record);
       }
       received += records.length;
     }
@@ -163,6 +177,47 @@ async function consume(
       await new Promise((resolve) => setTimeout(resolve, FOLLOW_INTERVAL_MS));
     }
   }
+}
+
+// Reads as one member of `group`, printing the assignment whenever it changes and
+// committing after every poll. Ctrl+C leaves the group cleanly, so the other
+// members take over its partitions at once instead of after a timeout.
+async function consumeAsGroup(connection: Connection, topic: string, group: string, follow: boolean): Promise<void> {
+  const consumer = new GroupConsumer(connection, group, topic);
+  let stopping = false;
+  const stop = (): void => {
+    stopping = true;
+  };
+  process.once("SIGINT", stop);
+  let shownGeneration = 0;
+  try {
+    while (!stopping) {
+      const records = await consumer.poll();
+      if (consumer.generation !== shownGeneration) {
+        shownGeneration = consumer.generation;
+        const owned = consumer.partitions.length === 0 ? "none (more members than partitions)" : consumer.partitions.join(", ");
+        console.log(`${consumer.memberId} of group ${group}, generation ${shownGeneration}: partitions ${owned}`);
+      }
+      for (const record of records) {
+        printRecord(topic, record.partition, record);
+      }
+      await consumer.commit();
+      if (records.length === 0) {
+        if (!follow) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, FOLLOW_INTERVAL_MS));
+      }
+    }
+  } finally {
+    process.off("SIGINT", stop);
+    await consumer.close();
+  }
+}
+
+function printRecord(topic: string, partition: number, record: LogRecord): void {
+  const key = record.key === null ? "(none)" : record.key.toString();
+  console.log(`${topic}/${partition} offset ${record.offset}  key=${key}  value=${record.value.toString()}`);
 }
 
 async function withConnection<T>(host: string, port: number, body: (connection: Connection) => Promise<T>): Promise<T> {
