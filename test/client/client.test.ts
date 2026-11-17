@@ -13,6 +13,7 @@ import type { LogRecord, RecordInput } from "../../src/common/types.js";
 import { BrokerServer } from "../../src/server/broker-server.js";
 import { partitionForKey } from "../../src/topic/partitioner.js";
 import { TopicManager } from "../../src/topic/topic-manager.js";
+import { openGroups } from "../helpers/groups.js";
 import { createTempDir, removeTempDirs } from "../helpers/temp-dir.js";
 
 after(removeTempDirs);
@@ -25,13 +26,18 @@ async function withClient(
 ): Promise<void> {
   const dataDir = await createTempDir();
   const topics = await TopicManager.open(dataDir, { logOptions: { syncOnAppend: false } });
-  const server = await BrokerServer.start(topics, { port: 0, ...(maxRecordBytes === undefined ? {} : { maxRecordBytes }) });
+  const { groups, offsets } = await openGroups(topics, dataDir);
+  const server = await BrokerServer.start(topics, groups, {
+    port: 0,
+    ...(maxRecordBytes === undefined ? {} : { maxRecordBytes }),
+  });
   const connection = await Connection.connect({ port: server.port });
   try {
     await body(connection, server, dataDir);
   } finally {
     await connection.close().catch(() => {}); // may already be closed by the test
     await server.close();
+    await offsets.close();
     await topics.close();
   }
 }
@@ -183,7 +189,8 @@ describe("clients against a real broker", () => {
     const dataDir = await createTempDir();
     for (const step of ["write", "read"]) {
       const topics = await TopicManager.open(dataDir);
-      const server = await BrokerServer.start(topics, { port: 0 });
+      const { groups, offsets } = await openGroups(topics, dataDir);
+      const server = await BrokerServer.start(topics, groups, { port: 0 });
       const connection = await Connection.connect({ port: server.port });
       try {
         if (step === "write") {
@@ -195,6 +202,7 @@ describe("clients against a real broker", () => {
       } finally {
         await connection.close();
         await server.close();
+        await offsets.close();
         await topics.close();
       }
     }
@@ -212,10 +220,13 @@ describe("clients against a real broker", () => {
 
   test("connecting to a port where nothing listens is rejected", async () => {
     // Start and stop a broker to find a port that is free right now.
-    const topics = await TopicManager.open(await createTempDir());
-    const server = await BrokerServer.start(topics, { port: 0 });
+    const dir = await createTempDir();
+    const topics = await TopicManager.open(dir);
+    const { groups, offsets } = await openGroups(topics, dir);
+    const server = await BrokerServer.start(topics, groups, { port: 0 });
     const port = server.port;
     await server.close();
+    await offsets.close();
     await topics.close();
     await assert.rejects(Connection.connect({ port }));
   });

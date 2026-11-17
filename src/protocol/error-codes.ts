@@ -3,6 +3,7 @@
 // takes the next free number.
 
 import type { RequestErrorCode } from "../broker/request-error.js";
+import type { GroupErrorCode } from "../group/group-error.js";
 import type { LogErrorCode } from "../storage/log.js";
 import type { TopicErrorCode } from "../topic/topic-metadata.js";
 import type { ProtocolErrorCode } from "./protocol-error.js";
@@ -13,7 +14,8 @@ export type ErrorCode =
   | ProtocolErrorCode
   | TopicErrorCode
   | LogErrorCode
-  | RequestErrorCode;
+  | RequestErrorCode
+  | GroupErrorCode;
 
 /** The wire number for "no error": the request succeeded. */
 export const NO_ERROR = 0;
@@ -42,6 +44,13 @@ const WIRE_NUMBERS: Readonly<Record<ErrorCode, number>> = {
   CORRUPT_LOG: 17,
 
   RECORD_TOO_LARGE: 18,
+
+  INVALID_GROUP_ID: 19,
+  UNKNOWN_MEMBER: 20,
+  STALE_GENERATION: 21,
+  REBALANCE_IN_PROGRESS: 22,
+  NOT_PARTITION_OWNER: 23,
+  INCONSISTENT_GROUP_TOPIC: 24,
 };
 
 const CODES_BY_NUMBER = new Map<number, ErrorCode>();

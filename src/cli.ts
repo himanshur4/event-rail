@@ -1,6 +1,7 @@
 // A command-line program to run a broker and talk to it. See USAGE below. It only
 // reads arguments and prints results; the classes it calls do the real work.
 
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 
 import { Admin } from "./client/admin.js";
@@ -8,6 +9,8 @@ import { Connection } from "./client/connection.js";
 import { Consumer } from "./client/consumer.js";
 import { Producer } from "./client/producer.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "./common/network-defaults.js";
+import { GroupCoordinator } from "./group/group-coordinator.js";
+import { OffsetStore } from "./group/offset-store.js";
 import { BrokerServer } from "./server/broker-server.js";
 import { TopicManager } from "./topic/topic-manager.js";
 
@@ -101,8 +104,14 @@ async function runBroker(dataDir: string, host: string, port: number): Promise<v
         `discarded ${recovery.tail.discardedBytes} bytes of a torn write (${recovery.tail.reason})`,
     );
   }
+  // Outside data/topics/, so the offsets log is never mistaken for a topic.
+  const offsets = await OffsetStore.open(join(dataDir, "internal", "offsets"));
+  if (offsets.recoveredTail !== null) {
+    console.log(`recovered the committed-offsets log: discarded ${offsets.recoveredTail.discardedBytes} bytes of a torn write`);
+  }
+  const groups = new GroupCoordinator(topics, offsets);
   const log = (line: string): void => console.error(`${new Date().toISOString()} ${line}`);
-  const server = await BrokerServer.start(topics, { host, port, log });
+  const server = await BrokerServer.start(topics, groups, { host, port, log });
   console.log(`EventRail broker listening on ${server.host}:${server.port}, data in ${dataDir}`);
 
   await new Promise<void>((resolve) => {
@@ -111,6 +120,7 @@ async function runBroker(dataDir: string, host: string, port: number): Promise<v
   });
   console.log("shutting down: answering requests in progress, then closing storage");
   await server.close();
+  await offsets.close();
   await topics.close();
   console.log("stopped");
 }

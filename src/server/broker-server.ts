@@ -1,15 +1,17 @@
 // Listens on a TCP port and gives each client connection its own ServerConnection.
-// Connections share one RequestHandler and one TopicManager, so there is one copy
-// of the data, but each has its own decoder and queue, so one misbehaving client
-// can't mix up another's requests.
+// Connections share one RequestHandler, TopicManager and GroupCoordinator, so there
+// is one copy of the data, but each has its own decoder and queue, so one
+// misbehaving client can't mix up another's requests.
 //
-// The server doesn't own the TopicManager: whoever opened it closes it, after the
-// server, so storage stays open until the final request has been answered.
+// The server doesn't own the storage: whoever opened the TopicManager and the
+// offset store closes them, after the server, so they stay open until the final
+// request has been answered.
 
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
 
 import { DEFAULT_MAX_RECORD_BYTES, RequestHandler } from "../broker/request-handler.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../common/network-defaults.js";
+import type { GroupCoordinator } from "../group/group-coordinator.js";
 import { DEFAULT_MAX_FRAME_BYTES } from "../protocol/frame.js";
 import type { TopicManager } from "../topic/topic-manager.js";
 import { ServerConnection } from "./server-connection.js";
@@ -34,27 +36,41 @@ export interface BrokerServerOptions {
   readonly log?: (message: string) => void;
 }
 
-/** A running broker: a TCP server in front of one TopicManager. */
+// How often the group coordinator removes silent members and ends overdue rebalances.
+const GROUP_TICK_MS = 100;
+
+/** A running broker: a TCP server in front of one TopicManager and GroupCoordinator. */
 export class BrokerServer {
   private readonly server: Server;
   private readonly handler: RequestHandler;
   private readonly options: Required<BrokerServerOptions>;
+  private readonly groupTimer: NodeJS.Timeout;
   private readonly connections = new Set<ServerConnection>();
   // The shutdown in progress, so close() can be called twice safely.
   private closing: Promise<void> | null = null;
 
   // Private: starting needs `await`, so callers use start().
-  private constructor(server: Server, handler: RequestHandler, options: Required<BrokerServerOptions>) {
+  private constructor(
+    server: Server,
+    handler: RequestHandler,
+    groups: GroupCoordinator,
+    options: Required<BrokerServerOptions>,
+  ) {
     this.server = server;
     this.handler = handler;
     this.options = options;
+    this.groupTimer = setInterval(() => groups.tick(), GROUP_TICK_MS);
   }
 
   /**
-   * Starts listening and serving requests against `topics`. Rejects if the
-   * port can't be used (for example, another program already has it).
+   * Starts listening and serving requests against `topics` and `groups`. Rejects
+   * if the port can't be used (for example, another program already has it).
    */
-  static async start(topics: TopicManager, options: BrokerServerOptions = {}): Promise<BrokerServer> {
+  static async start(
+    topics: TopicManager,
+    groups: GroupCoordinator,
+    options: BrokerServerOptions = {},
+  ): Promise<BrokerServer> {
     const resolved: Required<BrokerServerOptions> = {
       host: options.host ?? DEFAULT_HOST,
       port: options.port ?? DEFAULT_PORT,
@@ -66,23 +82,28 @@ export class BrokerServer {
       shutdownGraceMs: options.shutdownGraceMs ?? 5000,
       log: options.log ?? (() => {}),
     };
-    const handler = new RequestHandler(topics, {
+    const handler = new RequestHandler(topics, groups, {
       maxRecordBytes: resolved.maxRecordBytes,
       maxResponseBytes: resolved.maxFrameBytes,
     });
     // allowHalfOpen: a client that has finished sending may still be owed answers,
     // so don't close our side automatically.
     const server = createServer({ allowHalfOpen: true });
-    const broker = new BrokerServer(server, handler, resolved);
+    const broker = new BrokerServer(server, handler, groups, resolved);
     server.on("connection", (socket: Socket) => broker.accept(socket));
 
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(resolved.port, resolved.host, () => {
-        server.off("error", reject);
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(resolved.port, resolved.host, () => {
+          server.off("error", reject);
+          resolve();
+        });
       });
-    });
+    } catch (error) {
+      clearInterval(broker.groupTimer);
+      throw error;
+    }
     server.on("error", (error) => resolved.log(`server: ${error.message}`));
     return broker;
   }
@@ -104,7 +125,7 @@ export class BrokerServer {
 
   /**
    * Stops accepting connections, answers every request already received, and
-   * closes all connections. Does not close the TopicManager. Safe to call twice.
+   * closes all connections. Does not close the storage. Safe to call twice.
    */
   close(): Promise<void> {
     if (this.closing === null) {
@@ -131,6 +152,7 @@ export class BrokerServer {
   }
 
   private async closeNow(): Promise<void> {
+    clearInterval(this.groupTimer);
     // Stops accepting at once; the callback runs when every connection has closed.
     const stopped = new Promise<void>((resolve) => this.server.close(() => resolve()));
     await Promise.all([...this.connections].map((connection) => connection.close(this.options.shutdownGraceMs)));

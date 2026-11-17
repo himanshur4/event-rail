@@ -8,6 +8,8 @@ import { API_KEYS, API_VERSION, type FetchResponse } from "../../src/protocol/me
 import { LogError } from "../../src/storage/log.js";
 import { TopicManager } from "../../src/topic/topic-manager.js";
 import { TopicError } from "../../src/topic/topic-metadata.js";
+import type { GroupCoordinator } from "../../src/group/group-coordinator.js";
+import { openGroups } from "../helpers/groups.js";
 import { createTempDir, removeTempDirs } from "../helpers/temp-dir.js";
 
 after(removeTempDirs);
@@ -17,12 +19,15 @@ after(removeTempDirs);
 // syncOnAppend: false skips fsync, which only makes these tests slower.
 async function withHandler(
   options: RequestHandlerOptions,
-  body: (handler: RequestHandler, topics: TopicManager) => Promise<void>,
+  body: (handler: RequestHandler, topics: TopicManager, groups: GroupCoordinator) => Promise<void>,
 ): Promise<void> {
-  const topics = await TopicManager.open(await createTempDir(), { logOptions: { syncOnAppend: false } });
+  const dir = await createTempDir();
+  const topics = await TopicManager.open(dir, { logOptions: { syncOnAppend: false } });
+  const { groups, offsets } = await openGroups(topics, dir);
   try {
-    await body(new RequestHandler(topics, options), topics);
+    await body(new RequestHandler(topics, groups, options), topics, groups);
   } finally {
+    await offsets.close();
     await topics.close();
   }
 }
@@ -186,8 +191,46 @@ describe("RequestHandler", () => {
   });
 
   test("limits that can't fetch a maximum-size record are refused", async () => {
-    await withHandler({}, async (_handler, topics) => {
-      assert.throws(() => new RequestHandler(topics, { maxRecordBytes: 100, maxResponseBytes: 145 }), RangeError);
+    await withHandler({}, async (_handler, topics, groups) => {
+      assert.throws(() => new RequestHandler(topics, groups, { maxRecordBytes: 100, maxResponseBytes: 145 }), RangeError);
+    });
+  });
+
+  test("group requests reach the coordinator: join, heartbeat, commit, fetch the offset, leave", async () => {
+    await withHandler({}, async (handler) => {
+      await handler.handle({ type: "createTopic", topic: "orders", partitionCount: 2 });
+      await handler.handle({ type: "produce", topic: "orders", partition: 1, records: [recordOfSize(1)] });
+      assert.deepEqual(await handler.handle({ type: "joinGroup", group: "billing", topic: "orders", memberId: "" }), {
+        type: "joinGroup",
+        memberId: "member-1",
+        status: "assigned",
+        generation: 1,
+        partitions: [0, 1],
+      });
+      assert.deepEqual(await handler.handle({ type: "heartbeat", group: "billing", memberId: "member-1", generation: 1 }), {
+        type: "heartbeat",
+      });
+      const commit = {
+        type: "commitOffset",
+        group: "billing",
+        memberId: "member-1",
+        generation: 1,
+        topic: "orders",
+        partition: 1,
+        offset: 1,
+      } as const;
+      assert.deepEqual(await handler.handle(commit), { type: "commitOffset" });
+      assert.deepEqual(await handler.handle({ type: "fetchOffset", group: "billing", topic: "orders", partition: 1 }), {
+        type: "fetchOffset",
+        offset: 1,
+      });
+      assert.deepEqual(await handler.handle({ type: "fetchOffset", group: "billing", topic: "orders", partition: 0 }), {
+        type: "fetchOffset",
+        offset: null,
+      });
+      assert.deepEqual(await handler.handle({ type: "leaveGroup", group: "billing", memberId: "member-1" }), {
+        type: "leaveGroup",
+      });
     });
   });
 });

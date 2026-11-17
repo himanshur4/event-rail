@@ -11,6 +11,7 @@ import { FrameDecoder, encodeFrame } from "../../src/protocol/frame.js";
 import type { ApiRequest, ApiResponse } from "../../src/protocol/messages.js";
 import { BrokerServer, type BrokerServerOptions } from "../../src/server/broker-server.js";
 import { TopicManager } from "../../src/topic/topic-manager.js";
+import { openGroups } from "../helpers/groups.js";
 import { createTempDir, removeTempDirs } from "../helpers/temp-dir.js";
 
 after(removeTempDirs);
@@ -66,13 +67,16 @@ async function withBroker(
   options: BrokerServerOptions,
   body: (server: BrokerServer, logs: string[]) => Promise<void>,
 ): Promise<void> {
-  const topics = await TopicManager.open(await createTempDir(), { logOptions: { syncOnAppend: false } });
+  const dir = await createTempDir();
+  const topics = await TopicManager.open(dir, { logOptions: { syncOnAppend: false } });
+  const { groups, offsets } = await openGroups(topics, dir);
   const logs: string[] = [];
-  const server = await BrokerServer.start(topics, { port: 0, ...options, log: (line) => logs.push(line) });
+  const server = await BrokerServer.start(topics, groups, { port: 0, ...options, log: (line) => logs.push(line) });
   try {
     await body(server, logs);
   } finally {
     await server.close();
+    await offsets.close();
     await topics.close();
   }
 }
@@ -241,8 +245,10 @@ describe("BrokerServer", () => {
   test("close() answers requests already received, then refuses new connections", async () => {
     // fsync stays ON here: every produce waits for the disk, so most of the
     // requests below are still queued when close() is called.
-    const topics = await TopicManager.open(await createTempDir());
-    const server = await BrokerServer.start(topics, { port: 0, maxInFlightRequests: 1000 });
+    const dir = await createTempDir();
+    const topics = await TopicManager.open(dir);
+    const { groups, offsets } = await openGroups(topics, dir);
+    const server = await BrokerServer.start(topics, groups, { port: 0, maxInFlightRequests: 1000 });
     const port = server.port;
     try {
       const client = await RawClient.connect(port);
@@ -271,6 +277,7 @@ describe("BrokerServer", () => {
       await assert.rejects(RawClient.connect(port)); // nobody listening any more
     } finally {
       await server.close(); // safe to call twice
+      await offsets.close();
       await topics.close();
     }
   });

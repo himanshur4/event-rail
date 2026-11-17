@@ -60,6 +60,11 @@ const REQUESTS: ApiRequest[] = [
     ],
   },
   { type: "fetch", topic: "orders", partition: 2, offset: Number.MAX_SAFE_INTEGER, maxRecords: 500 },
+  { type: "joinGroup", group: "billing", topic: "orders", memberId: "" },
+  { type: "heartbeat", group: "billing", memberId: "member-1", generation: 4_294_967_295 },
+  { type: "leaveGroup", group: "billing", memberId: "member-1" },
+  { type: "commitOffset", group: "billing", memberId: "member-1", generation: 3, topic: "orders", partition: 2, offset: Number.MAX_SAFE_INTEGER },
+  { type: "fetchOffset", group: "billing", topic: "orders", partition: 2 },
 ];
 
 // One success response of every type, again with awkward values (a negative
@@ -82,6 +87,13 @@ const RESPONSES: SuccessResponse[] = [
       { offset: 11, timestamp: -1, key: null, value: Buffer.alloc(0) },
     ],
   },
+  { type: "joinGroup", memberId: "member-1", status: "assigned", generation: 3, partitions: [0, 2] },
+  { type: "joinGroup", memberId: "member-2", status: "waiting", generation: 0, partitions: [] },
+  { type: "heartbeat" },
+  { type: "leaveGroup" },
+  { type: "commitOffset" },
+  { type: "fetchOffset", offset: 0 },
+  { type: "fetchOffset", offset: null },
 ];
 
 describe("requests", () => {
@@ -300,6 +312,19 @@ describe("responses", () => {
     // A broker bug, so RangeError, not ProtocolError.
     assert.throws(() => encodeResponse(headerFor("fetch"), produced), RangeError);
     assert.throws(() => encodeResponse({ ...headerFor("produce"), apiVersion: 1 }, produced), RangeError);
+  });
+
+  test("a join answer with an unknown status, or a committed offset below -1, is malformed", () => {
+    const join = encodeResponse(headerFor("joinGroup"), { type: "joinGroup", memberId: "m", status: "waiting", generation: 0, partitions: [] });
+    // Bytes: header (8), error number (2), memberId (2 + 1), then the status byte.
+    const badStatus = Buffer.from(join);
+    badStatus[13] = 7;
+    assert.throws(() => decodeResponse(badStatus), isProtocolError("MALFORMED_MESSAGE"));
+
+    const fetched = encodeResponse(headerFor("fetchOffset"), { type: "fetchOffset", offset: null });
+    const belowNone = Buffer.from(fetched);
+    belowNone.writeBigInt64BE(-2n, 10);
+    assert.throws(() => decodeResponse(belowNone), isProtocolError("MALFORMED_MESSAGE"));
   });
 
   test("a success response for an unknown API or version is UNSUPPORTED_VERSION", () => {

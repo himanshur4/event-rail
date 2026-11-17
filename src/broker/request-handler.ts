@@ -1,8 +1,10 @@
 // What the broker does with each request: turns a decoded request into calls on
-// TopicManager and the partition logs. It knows nothing about sockets or bytes,
-// so it can be tested without a network.
+// TopicManager, the partition logs and the group coordinator. It knows nothing
+// about sockets or bytes, so it can be tested without a network.
 
 import type { LogRecord } from "../common/types.js";
+import type { GroupCoordinator } from "../group/group-coordinator.js";
+import { GroupError } from "../group/group-error.js";
 import { FETCH_RESPONSE_BASE_BYTES, fetchRecordBytes } from "../protocol/codec.js";
 import { DEFAULT_MAX_FRAME_BYTES } from "../protocol/frame.js";
 import type {
@@ -36,18 +38,20 @@ const ONE_RECORD_OVERHEAD =
   FETCH_RESPONSE_BASE_BYTES + fetchRecordBytes({ offset: 0, timestamp: 0, key: null, value: Buffer.alloc(0) });
 
 /**
- * Carries out decoded requests against a TopicManager. Errors are thrown as
- * the storage and topic layers raise them; errorResponseFor turns them into
- * error responses.
+ * Carries out decoded requests against a TopicManager and a GroupCoordinator.
+ * Errors are thrown as the lower layers raise them; errorResponseFor turns them
+ * into error responses.
  */
 export class RequestHandler {
   private readonly topics: TopicManager;
+  private readonly groups: GroupCoordinator;
   private readonly maxRecordBytes: number;
   private readonly maxResponseBytes: number;
   private readonly readChunk: number;
 
-  constructor(topics: TopicManager, options: RequestHandlerOptions = {}) {
+  constructor(topics: TopicManager, groups: GroupCoordinator, options: RequestHandlerOptions = {}) {
     this.topics = topics;
+    this.groups = groups;
     this.maxRecordBytes = options.maxRecordBytes ?? DEFAULT_MAX_RECORD_BYTES;
     this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_FRAME_BYTES;
     if (!Number.isSafeInteger(this.maxRecordBytes) || this.maxRecordBytes < 0) {
@@ -68,7 +72,7 @@ export class RequestHandler {
 
   /**
    * Carries out one request and returns its success response. Throws
-   * TopicError, LogError or RequestError when the request can't be done.
+   * TopicError, LogError, RequestError or GroupError when the request can't be done.
    */
   async handle(request: ApiRequest): Promise<SuccessResponse> {
     switch (request.type) {
@@ -81,6 +85,26 @@ export class RequestHandler {
         return this.produce(request);
       case "fetch":
         return this.fetch(request);
+      case "joinGroup":
+        return { type: "joinGroup", ...this.groups.join(request.group, request.topic, request.memberId) };
+      case "heartbeat":
+        this.groups.heartbeat(request.group, request.memberId, request.generation);
+        return { type: "heartbeat" };
+      case "leaveGroup":
+        this.groups.leave(request.group, request.memberId);
+        return { type: "leaveGroup" };
+      case "commitOffset":
+        await this.groups.commit(
+          request.group,
+          request.memberId,
+          request.generation,
+          request.topic,
+          request.partition,
+          request.offset,
+        );
+        return { type: "commitOffset" };
+      case "fetchOffset":
+        return { type: "fetchOffset", offset: this.groups.fetchOffset(request.group, request.topic, request.partition) };
       default: {
         const unhandled: never = request;
         throw new Error(`unhandled request ${JSON.stringify(unhandled)}`);
@@ -158,7 +182,8 @@ export function errorResponseFor(error: unknown): ErrorResponse {
     error instanceof TopicError ||
     error instanceof LogError ||
     error instanceof ProtocolError ||
-    error instanceof RequestError
+    error instanceof RequestError ||
+    error instanceof GroupError
   ) {
     return { type: "error", code: error.code, message: error.message };
   }

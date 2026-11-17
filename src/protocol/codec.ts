@@ -32,9 +32,16 @@ import {
   API_VERSION,
   type ApiRequest,
   type ApiResponse,
+  type CommitOffsetRequest,
   type CreateTopicRequest,
+  type FetchOffsetRequest,
+  type FetchOffsetResponse,
   type FetchRequest,
   type FetchResponse,
+  type HeartbeatRequest,
+  type JoinGroupRequest,
+  type JoinGroupResponse,
+  type LeaveGroupRequest,
   type MessageHeader,
   type MetadataResponse,
   type ProduceRequest,
@@ -159,6 +166,21 @@ function writeRequestBody(writer: BinaryWriter, request: ApiRequest): void {
     case "fetch":
       writeFetchRequest(writer, request);
       break;
+    case "joinGroup":
+      writeJoinGroupRequest(writer, request);
+      break;
+    case "heartbeat":
+      writeHeartbeatRequest(writer, request);
+      break;
+    case "leaveGroup":
+      writeLeaveGroupRequest(writer, request);
+      break;
+    case "commitOffset":
+      writeCommitOffsetRequest(writer, request);
+      break;
+    case "fetchOffset":
+      writeFetchOffsetRequest(writer, request);
+      break;
     default:
       unreachable(request);
   }
@@ -177,6 +199,16 @@ function readRequestBody(header: MessageHeader, reader: BinaryReader): ApiReques
       return readProduceRequest(reader);
     case API_KEYS.fetch:
       return readFetchRequest(reader);
+    case API_KEYS.joinGroup:
+      return readJoinGroupRequest(reader);
+    case API_KEYS.heartbeat:
+      return readHeartbeatRequest(reader);
+    case API_KEYS.leaveGroup:
+      return readLeaveGroupRequest(reader);
+    case API_KEYS.commitOffset:
+      return readCommitOffsetRequest(reader);
+    case API_KEYS.fetchOffset:
+      return readFetchOffsetRequest(reader);
     default:
       throw unsupported(header);
   }
@@ -194,6 +226,16 @@ function writeResponseBody(writer: BinaryWriter, response: SuccessResponse): voi
       break;
     case "fetch":
       writeFetchResponse(writer, response);
+      break;
+    case "joinGroup":
+      writeJoinGroupResponse(writer, response);
+      break;
+    case "heartbeat":
+    case "leaveGroup":
+    case "commitOffset":
+      break;
+    case "fetchOffset":
+      writeFetchOffsetResponse(writer, response);
       break;
     default:
       unreachable(response);
@@ -213,6 +255,16 @@ function readResponseBody(header: MessageHeader, reader: BinaryReader): SuccessR
       return readProduceResponse(reader);
     case API_KEYS.fetch:
       return readFetchResponse(reader);
+    case API_KEYS.joinGroup:
+      return readJoinGroupResponse(reader);
+    case API_KEYS.heartbeat:
+      return { type: "heartbeat" };
+    case API_KEYS.leaveGroup:
+      return { type: "leaveGroup" };
+    case API_KEYS.commitOffset:
+      return { type: "commitOffset" };
+    case API_KEYS.fetchOffset:
+      return readFetchOffsetResponse(reader);
     default:
       throw unsupported(header);
   }
@@ -341,6 +393,139 @@ function readFetchResponse(reader: BinaryReader): FetchResponse {
     records.push({ offset, timestamp, key, value });
   }
   return { type: "fetch", logEndOffset, records };
+}
+
+// joinGroup (apiKey 4)
+//   request:   group string | topic string | memberId string ("" for a new member)
+//   response:  memberId string | status u8 (0 waiting, 1 assigned) | generation u32 |
+//              partition count u32 | each partition u32
+
+const JOIN_WAITING = 0;
+const JOIN_ASSIGNED = 1;
+
+function writeJoinGroupRequest(writer: BinaryWriter, request: JoinGroupRequest): void {
+  writer.string(request.group);
+  writer.string(request.topic);
+  writer.string(request.memberId);
+}
+
+function readJoinGroupRequest(reader: BinaryReader): JoinGroupRequest {
+  const group = reader.string();
+  const topic = reader.string();
+  const memberId = reader.string();
+  return { type: "joinGroup", group, topic, memberId };
+}
+
+function writeJoinGroupResponse(writer: BinaryWriter, response: JoinGroupResponse): void {
+  writer.string(response.memberId);
+  writer.u8(response.status === "assigned" ? JOIN_ASSIGNED : JOIN_WAITING);
+  writer.u32(response.generation);
+  writer.u32(response.partitions.length);
+  for (const partition of response.partitions) {
+    writer.u32(partition);
+  }
+}
+
+function readJoinGroupResponse(reader: BinaryReader): JoinGroupResponse {
+  const memberId = reader.string();
+  const status = reader.u8();
+  if (status !== JOIN_WAITING && status !== JOIN_ASSIGNED) {
+    throw new ProtocolError("MALFORMED_MESSAGE", `unknown join status ${status}`);
+  }
+  const generation = reader.u32();
+  const count = reader.u32();
+  const partitions: number[] = [];
+  for (let i = 0; i < count; i++) {
+    partitions.push(reader.u32());
+  }
+  return { type: "joinGroup", memberId, status: status === JOIN_ASSIGNED ? "assigned" : "waiting", generation, partitions };
+}
+
+// heartbeat (apiKey 5)
+//   request:   group string | memberId string | generation u32
+//   response:  (no fields)
+
+function writeHeartbeatRequest(writer: BinaryWriter, request: HeartbeatRequest): void {
+  writer.string(request.group);
+  writer.string(request.memberId);
+  writer.u32(request.generation);
+}
+
+function readHeartbeatRequest(reader: BinaryReader): HeartbeatRequest {
+  const group = reader.string();
+  const memberId = reader.string();
+  const generation = reader.u32();
+  return { type: "heartbeat", group, memberId, generation };
+}
+
+// leaveGroup (apiKey 6)
+//   request:   group string | memberId string
+//   response:  (no fields)
+
+function writeLeaveGroupRequest(writer: BinaryWriter, request: LeaveGroupRequest): void {
+  writer.string(request.group);
+  writer.string(request.memberId);
+}
+
+function readLeaveGroupRequest(reader: BinaryReader): LeaveGroupRequest {
+  const group = reader.string();
+  const memberId = reader.string();
+  return { type: "leaveGroup", group, memberId };
+}
+
+// commitOffset (apiKey 7)
+//   request:   group string | memberId string | generation u32 | topic string |
+//              partition u32 | offset u64
+//   response:  (no fields)
+
+function writeCommitOffsetRequest(writer: BinaryWriter, request: CommitOffsetRequest): void {
+  writer.string(request.group);
+  writer.string(request.memberId);
+  writer.u32(request.generation);
+  writer.string(request.topic);
+  writer.u32(request.partition);
+  writer.u64(request.offset);
+}
+
+function readCommitOffsetRequest(reader: BinaryReader): CommitOffsetRequest {
+  const group = reader.string();
+  const memberId = reader.string();
+  const generation = reader.u32();
+  const topic = reader.string();
+  const partition = reader.u32();
+  const offset = reader.u64();
+  return { type: "commitOffset", group, memberId, generation, topic, partition, offset };
+}
+
+// fetchOffset (apiKey 8)
+//   request:   group string | topic string | partition u32
+//   response:  offset i64 (-1 when nothing is committed)
+
+const NO_COMMITTED_OFFSET = -1;
+
+function writeFetchOffsetRequest(writer: BinaryWriter, request: FetchOffsetRequest): void {
+  writer.string(request.group);
+  writer.string(request.topic);
+  writer.u32(request.partition);
+}
+
+function readFetchOffsetRequest(reader: BinaryReader): FetchOffsetRequest {
+  const group = reader.string();
+  const topic = reader.string();
+  const partition = reader.u32();
+  return { type: "fetchOffset", group, topic, partition };
+}
+
+function writeFetchOffsetResponse(writer: BinaryWriter, response: FetchOffsetResponse): void {
+  writer.i64(response.offset ?? NO_COMMITTED_OFFSET);
+}
+
+function readFetchOffsetResponse(reader: BinaryReader): FetchOffsetResponse {
+  const offset = reader.i64();
+  if (offset < NO_COMMITTED_OFFSET) {
+    throw new ProtocolError("MALFORMED_MESSAGE", `invalid committed offset ${offset}`);
+  }
+  return { type: "fetchOffset", offset: offset === NO_COMMITTED_OFFSET ? null : offset };
 }
 
 // Not MALFORMED_MESSAGE: the bytes may be valid for a newer version, and this

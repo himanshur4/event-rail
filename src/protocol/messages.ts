@@ -7,6 +7,12 @@
 //   2       produce       topic, partition, records         offsets given to the records
 //   3       fetch         topic, partition, offset,         log end offset, records
 //                         maxRecords
+//   4       joinGroup     group, topic, memberId            memberId, status, generation, partitions
+//   5       heartbeat     group, memberId, generation       (none)
+//   6       leaveGroup    group, memberId                   (none)
+//   7       commitOffset  group, memberId, generation,      (none)
+//                         topic, partition, offset
+//   8       fetchOffset   group, topic, partition           committed offset, or none
 //
 // Any response can instead be an error: a code and a message.
 
@@ -54,10 +60,62 @@ export interface FetchRequest {
   readonly maxRecords: number;
 }
 
-/** Any request. Check `type` to see which one. */
-export type ApiRequest = CreateTopicRequest | MetadataRequest | ProduceRequest | FetchRequest;
+/** Joins a consumer group, or asks again while the group rebalances. */
+export interface JoinGroupRequest {
+  readonly type: "joinGroup";
+  readonly group: string;
+  readonly topic: string;
+  /** "" for a new member; afterwards, the id the broker gave it. */
+  readonly memberId: string;
+}
 
-/** The name of an API: "createTopic" | "metadata" | "produce" | "fetch". */
+/** Tells the broker the member is still alive and still in `generation`. */
+export interface HeartbeatRequest {
+  readonly type: "heartbeat";
+  readonly group: string;
+  readonly memberId: string;
+  readonly generation: number;
+}
+
+/** Leaves the group, so its partitions move to other members at once. */
+export interface LeaveGroupRequest {
+  readonly type: "leaveGroup";
+  readonly group: string;
+  readonly memberId: string;
+}
+
+/** Records the next offset the group will read from one of the member's partitions. */
+export interface CommitOffsetRequest {
+  readonly type: "commitOffset";
+  readonly group: string;
+  readonly memberId: string;
+  readonly generation: number;
+  readonly topic: string;
+  readonly partition: number;
+  readonly offset: number;
+}
+
+/** Asks for the group's committed offset for one partition. */
+export interface FetchOffsetRequest {
+  readonly type: "fetchOffset";
+  readonly group: string;
+  readonly topic: string;
+  readonly partition: number;
+}
+
+/** Any request. Check `type` to see which one. */
+export type ApiRequest =
+  | CreateTopicRequest
+  | MetadataRequest
+  | ProduceRequest
+  | FetchRequest
+  | JoinGroupRequest
+  | HeartbeatRequest
+  | LeaveGroupRequest
+  | CommitOffsetRequest
+  | FetchOffsetRequest;
+
+/** The name of an API, such as "produce" or "joinGroup". */
 export type ApiName = ApiRequest["type"];
 
 /** The topic was created. */
@@ -91,6 +149,37 @@ export interface FetchResponse {
   readonly records: readonly LogRecord[];
 }
 
+/** "waiting" while the group rebalances (ask again), then the member's assignment. */
+export interface JoinGroupResponse {
+  readonly type: "joinGroup";
+  readonly memberId: string;
+  readonly status: "waiting" | "assigned";
+  /** 0 while waiting. */
+  readonly generation: number;
+  readonly partitions: readonly number[];
+}
+
+/** The member is alive and its generation is current. */
+export interface HeartbeatResponse {
+  readonly type: "heartbeat";
+}
+
+/** The member has left the group. */
+export interface LeaveGroupResponse {
+  readonly type: "leaveGroup";
+}
+
+/** The commit is durable. */
+export interface CommitOffsetResponse {
+  readonly type: "commitOffset";
+}
+
+/** The committed offset, or null if the group has none for that partition. */
+export interface FetchOffsetResponse {
+  readonly type: "fetchOffset";
+  readonly offset: number | null;
+}
+
 /** The request failed: `code` says why for programs, `message` explains it for people. */
 export interface ErrorResponse {
   readonly type: "error";
@@ -99,7 +188,16 @@ export interface ErrorResponse {
 }
 
 /** The response to a request that succeeded. */
-export type SuccessResponse = CreateTopicResponse | MetadataResponse | ProduceResponse | FetchResponse;
+export type SuccessResponse =
+  | CreateTopicResponse
+  | MetadataResponse
+  | ProduceResponse
+  | FetchResponse
+  | JoinGroupResponse
+  | HeartbeatResponse
+  | LeaveGroupResponse
+  | CommitOffsetResponse
+  | FetchOffsetResponse;
 
 /** Any response: a success, or an error. */
 export type ApiResponse = SuccessResponse | ErrorResponse;
@@ -110,6 +208,11 @@ export const API_KEYS: Readonly<Record<ApiName, number>> = {
   metadata: 1,
   produce: 2,
   fetch: 3,
+  joinGroup: 4,
+  heartbeat: 5,
+  leaveGroup: 6,
+  commitOffset: 7,
+  fetchOffset: 8,
 };
 
 /** The layout version of every API in this code. */
