@@ -6,15 +6,6 @@ consumers read those logs by offset, split a topic's partitions through
 consumer groups, and commit their progress so that another member can continue
 where they stopped.
 
-> **Status:** complete for its single-broker scope. Segmented, checksummed logs
-> with crash recovery, key-partitioned topics, a binary wire protocol, a TCP
-> broker server, producer, consumer, and admin clients with a command-line tool,
-> and consumer groups with committed offsets are implemented and tested. A
-> multi-broker cluster with replication and leader failover is designed but not
-> built; sections marked *(planned)* describe that design, not current behavior.
-> EventRail uses its own wire protocol, is not production-ready, and has not
-> been benchmarked.
-
 ## Contents
 
 - [How it works](#how-it-works)
@@ -105,20 +96,6 @@ without a network and the protocol can be tested without sockets.
            crash recovery
 ```
 
-### Cluster *(planned)*
-
-```
- Producers ──┐                                         ┌── Consumer group "billing"
-             ▼                                         ▼
-  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-  │ Broker 1         │  │ Broker 2         │  │ Broker 3         │
-  │ (controller)     │  │                  │  │                  │
-  │ orders-0 leader  │  │ orders-0 follower│  │ orders-0 follower│
-  │ orders-1 follower│  │ orders-1 leader  │  │ orders-1 follower│
-  │ orders-2 follower│  │ orders-2 follower│  │ orders-2 leader  │
-  └──────────────────┘  └──────────────────┘  └──────────────────┘
-     Replication factor 3: each partition has one leader and two followers.
-```
 
 The controller (broker 1) tracks broker liveness, assigns partition replicas,
 and elects a new leader from the in-sync replicas when a leader fails.
@@ -425,86 +402,7 @@ src/
   group/group-error.ts     GroupError and its codes
   client/group-consumer.ts joins a group, sends heartbeats, polls and commits its partitions
   cli.ts                   command-line tool: broker, topics, produce, consume
-test/
-  helpers/temp-dir.ts      per-test temporary directories
-  helpers/groups.ts        a group coordinator with its offset store, for tests
-  storage/log-contract.ts  contract tests every Log implementation must pass
-  storage/memory-log.test.ts
-  storage/file-log.test.ts contract, persistence, segment, index-repair, and recovery tests
-  storage/record-batch.test.ts
-  topic/partitioner.test.ts
-  topic/topic-manager.test.ts
-  protocol/frame.test.ts
-  protocol/binary.test.ts
-  protocol/codec.test.ts
-  protocol/error-codes.test.ts
-  broker/request-handler.test.ts
-  server/broker-server.test.ts  raw-socket tests of the server
-  client/client.test.ts    clients against a real broker, end to end
-  client/connection.test.ts  the client against a misbehaving fake broker
-  group/offset-store.test.ts  replay, last commit wins, torn commits, bad records
-  group/group-coordinator.test.ts  rebalances, timeouts, and fencing on a fake clock
-  client/group-consumer.test.ts  group members against a real broker
 ```
-
-## Testing approach
-
-- **Contract tests.** The rules of the `Log` interface are written once in
-  [test/storage/log-contract.ts](test/storage/log-contract.ts) and run against
-  every implementation, so `MemoryLog` and `FileLog` are held to identical
-  rules, including concurrent appends issued without awaiting each other.
-  `FileLog` runs the suite three times: default segments, tiny segments, and
-  tiny segments without fsync per append.
-- **Persistence tests.** `FileLog` is closed and reopened to verify records and
-  offsets survive, and its file is compared byte for byte with the expected
-  encoded batches.
-- **Crash recovery tests.** Torn writes are simulated by editing files: a
-  final batch cut after every possible byte, trailing zero bytes, a garbled
-  unindexed batch, a torn first batch in a new segment, and a crash with
-  index entries still pending. Each must be cut off and the log must keep
-  working. Damage that a crash cannot explain (an indexed batch, a sealed
-  segment, a valid batch with the wrong offset, damage followed by indexed
-  data) must be refused with the files left byte-for-byte unchanged.
-- **Segment and index tests.** Rolling, oversized batches, exact index bytes,
-  missing segment files, and five kinds of index damage (missing, truncated,
-  partial entry, non-increasing, out of range), each of which must be repaired
-  back to the original index.
-- **Partitioning tests.** The hash is pinned to MurmurHash3's published values;
-  10,000 keys must spread evenly over 8 partitions; keys differing in a single
-  bit must not systematically share a partition; and records for interleaved
-  keys, routed through the partitioner, must come back in sending order from
-  their partition.
-- **Topic tests.** On-disk layout, restarts, half-created topics left by a
-  crash, six kinds of damaged `topic.json`, a missing partition directory,
-  per-partition recovery reports, concurrent creates of the same name, and
-  `close()` waiting for a creation in progress.
-- **Protocol tests.** A frame split into two chunks at every possible byte, a
-  stream delivered one byte at a time, an oversized length rejected from its
-  4-byte header alone, and every field type round-tripped at its extreme
-  values. Every request and response round-trips, four messages are pinned to
-  their exact documented bytes, and each message cut short at every possible
-  byte must raise `MALFORMED_MESSAGE`, as must impossible lengths, invalid
-  UTF-8, and leftover bytes. The error-number table is pinned by an
-  independent copy in the tests.
-- **Server and client tests.** The server is tested over real sockets with a
-  raw client: requests pipelined in one write are answered in order, a client
-  that disconnects mid-request leaves no trace, oversized and header-less frames
-  close only their own connection, and shutdown answers every request already
-  received. The client is tested against a fake broker that answers out of
-  order, too late, for the wrong API, or not at all. End-to-end tests run
-  producer, broker, and consumer together, including across a broker restart.
-- **Failure cases are first-class.** Invalid arguments, empty batches, and
-  out-of-range reads are tested alongside the normal path.
-- **Exhaustive damage tests.** The record batch decoder is checked against a
-  batch truncated at every possible byte (always `incomplete`) and a batch
-  with each single byte damaged (never accepted).
-- **Consumer group tests.** The coordinator runs on a fake clock, so session
-  and rebalance timeouts are tested without waiting: members that go silent or
-  do not rejoin are removed, and stale generations, removed members, and
-  non-owners cannot commit. End to end, group members on separate connections
-  split partitions, take over after a leave or a crash, continue from
-  committed offsets, and commit their progress before a rebalance.
-
 ## Roadmap
 
 - [x] Toolchain: strict TypeScript, build, test runner
